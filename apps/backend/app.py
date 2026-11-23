@@ -53,8 +53,10 @@ def init_schema(retries: int = 30, delay: float = 5.0) -> None:
 
     Wrapped in a parent span so the startup SQL is attributed to the backend
     service in X-Ray instead of appearing as an orphan database node.
+    SpanKind.SERVER makes the X-Ray exporter name the segment after the service
+    ("backend") rather than the span, so it merges into the existing map node.
     """
-    with tracer.start_as_current_span("backend.init_schema") as span:
+    with tracer.start_as_current_span("init_schema", kind=trace.SpanKind.SERVER) as span:
         for attempt in range(1, retries + 1):
             span.set_attribute("db.init.attempts", attempt)
             try:
