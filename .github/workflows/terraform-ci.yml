@@ -1,0 +1,55 @@
+name: terraform-ci
+
+# Static checks only - needs no AWS access.
+on:
+  pull_request:
+    paths: ["terraform/**", ".github/workflows/terraform-ci.yml"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/terraform-ci.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive ../..
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: tflint
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --chdir "$GITHUB_WORKSPACE/terraform"
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy IaC scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: terraform
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
+          exit-code: "1"
