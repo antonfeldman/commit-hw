@@ -1,0 +1,184 @@
+name: build-and-deploy
+
+# Pipeline: build the changed app image -> push to ECR -> publish the tag to SSM.
+# The SSM change triggers EventBridge -> Lambda -> CodeDeploy blue/green
+# (canary 10% for 5 minutes, then 100%, automatic rollback on 5XX alarm).
+# This workflow then watches the CodeDeploy deployment until it finishes.
+#
+# Authenticates to AWS with GitHub OIDC - no access keys are stored in GitHub.
+# The role can only push to the project ECR repos, write the image-tag
+# parameters and read deployment status - it cannot change ECS/IAM/ALB itself.
+on:
+  push:
+    branches: [main]
+    paths: ["apps/**"]
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Which service to deploy"
+        type: choice
+        options: [frontend, backend, both]
+        default: frontend
+      image_tag:
+        description: "Existing image tag to (re)deploy, e.g. for a rollback. Empty = build the current commit."
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: commit-hw
+  ENVIRONMENT: dev
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.detect.outputs.apps }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect apps to deploy
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_APP: ${{ inputs.app }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "$INPUT_APP" in
+              both) apps='["frontend","backend"]' ;;
+              *)    apps="[\"$INPUT_APP\"]" ;;
+            esac
+          else
+            apps="[]"
+            for app in frontend backend; do
+              if ! git diff --quiet "$BEFORE" "$AFTER" -- "apps/$app"; then
+                apps=$(echo "$apps" | jq -c --arg a "$app" '. + [$a]')
+              fi
+            done
+          fi
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+          echo "Apps to deploy: $apps" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: changes
+    if: needs.changes.outputs.apps != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required to request the OIDC token
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    # One deployment per service at a time (CodeDeploy rejects overlapping ones).
+    concurrency:
+      group: deploy-${{ matrix.app }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ matrix.app }}
+      REPOSITORY: commit-hw/${{ matrix.app }}
+      PARAMETER: /commit-hw/dev/${{ matrix.app }}/image-tag
+      CODEDEPLOY_APP: commit-hw-dev
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Resolve image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          tag="${INPUT_TAG:-$(git rev-parse --short HEAD)}"
+          if ! [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || [ "$tag" = "latest" ]; then
+            echo "::error::invalid image tag '$tag'"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag="$tag" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail if the requested tag was never built
+        if: inputs.image_tag != '' && steps.tag.outputs.exists != 'true'
+        run: |
+          echo "::error::image $REPOSITORY:${{ steps.tag.outputs.tag }} does not exist in ECR"
+          exit 1
+
+      # ---- Build (skipped when the immutable tag already exists) -------------
+      - name: Log in to Amazon ECR
+        id: ecr
+        if: steps.tag.outputs.exists != 'true'
+        uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        if: steps.tag.outputs.exists != 'true'
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.tag.outputs.exists != 'true'
+
+      - name: Build and push ${{ matrix.app }}
+        if: steps.tag.outputs.exists != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: apps/${{ matrix.app }}
+          platforms: linux/arm64
+          provenance: false
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ steps.tag.outputs.tag }}
+
+      # ---- Deploy: publish the tag; AWS does the blue/green --------------------
+      - name: Publish image tag to SSM (triggers CodeDeploy)
+        id: publish
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          previous=$(aws ssm get-parameter --name "$PARAMETER" --query Parameter.Value --output text)
+          echo "start=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+          aws ssm put-parameter --name "$PARAMETER" --value "$TAG" --type String --overwrite >/dev/null
+          echo "Published $PARAMETER: $previous -> $TAG"
+
+      - name: Wait for the CodeDeploy blue/green deployment
+        env:
+          START: ${{ steps.publish.outputs.start }}
+        run: |
+          deployment=""
+          for _ in $(seq 1 24); do   # up to 2 minutes for the Lambda to start it
+            deployment=$(aws deploy list-deployments \
+              --application-name "$CODEDEPLOY_APP" --deployment-group-name "$APP" \
+              --create-time-range start="$START" --query 'deployments[0]' --output text)
+            [ -n "$deployment" ] && [ "$deployment" != "None" ] && break
+            sleep 5
+          done
+          if [ -z "$deployment" ] || [ "$deployment" = "None" ]; then
+            echo "::error::no CodeDeploy deployment started - check the deployer Lambda logs"; exit 1
+          fi
+          echo "CodeDeploy deployment: $deployment"
+          echo "deployment=$deployment" >> "$GITHUB_STEP_SUMMARY"
+
+          for _ in $(seq 1 120); do  # up to 30 minutes
+            status=$(aws deploy get-deployment --deployment-id "$deployment" \
+              --query 'deploymentInfo.status' --output text)
+            echo "$(date -u +%H:%M:%S) $status"
+            case "$status" in
+              Succeeded) echo "Deployed $APP:${{ steps.tag.outputs.tag }} (blue/green succeeded)" >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+              Failed|Stopped)
+                aws deploy get-deployment --deployment-id "$deployment" --query 'deploymentInfo.errorInformation'
+                echo "::error::deployment $deployment $status (CodeDeploy rolled back automatically)"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::timed out waiting for $deployment"; exit 1

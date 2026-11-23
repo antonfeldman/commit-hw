@@ -2,9 +2,9 @@
 # Least-privilege security groups. Every rule is explicit and references another
 # security group (or the S3 prefix list) - there is no "allow all egress" anywhere.
 #
-#   Internet --80--> ALB --app--> frontend --app--> backend --5432--> RDS
-#                                    |                 |
-#                                    +--4317--> otel-collector
+#   Internet --443/80--> ALB --app--> frontend --80--> internal ALB --app--> backend --5432--> RDS
+#                                       |                                     |
+#                                       +-----------4317--> otel-collector <--+
 #   frontend/backend/collector --443--> VPC interface endpoints / S3 gateway
 #
 # Note: aws_security_group created by Terraform has its default allow-all egress
@@ -16,11 +16,20 @@ data "aws_prefix_list" "s3" {
 }
 
 resource "aws_security_group" "alb" {
-  name        = "${var.name}-alb"
+  name = "${var.name}-alb"
+  # Description is immutable (changing it replaces the group), so it keeps its Phase 1 text.
   description = "Public ALB: HTTP from allowed CIDRs, forwards to frontend only"
   vpc_id      = var.vpc_id
 
   tags = { Name = "${var.name}-alb" }
+}
+
+resource "aws_security_group" "backend_alb" {
+  name        = "${var.name}-backend-alb"
+  description = "Internal ALB: HTTP from frontend tasks only, forwards to backend only"
+  vpc_id      = var.vpc_id
+
+  tags = { Name = "${var.name}-backend-alb" }
 }
 
 resource "aws_security_group" "frontend" {
@@ -83,10 +92,21 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   for_each = toset(var.alb_ingress_cidrs)
 
   security_group_id = aws_security_group.alb.id
-  description       = "HTTP from the internet (task requires HTTP-only exposure)"
+  description       = "HTTP from the internet (answered with a 301 redirect to HTTPS)"
   ip_protocol       = "tcp"
   from_port         = 80
   to_port           = 80
+  cidr_ipv4         = each.value
+}
+
+resource "aws_vpc_security_group_ingress_rule" "alb_https" {
+  for_each = toset(var.alb_ingress_cidrs)
+
+  security_group_id = aws_security_group.alb.id
+  description       = "HTTPS from the internet"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
   cidr_ipv4         = each.value
 }
 
@@ -109,9 +129,28 @@ resource "aws_vpc_security_group_ingress_rule" "frontend_from_alb" {
   referenced_security_group_id = aws_security_group.alb.id
 }
 
-resource "aws_vpc_security_group_egress_rule" "frontend_to_backend" {
+resource "aws_vpc_security_group_egress_rule" "frontend_to_backend_alb" {
   security_group_id            = aws_security_group.frontend.id
-  description                  = "Call backend API"
+  description                  = "Call backend API through the internal ALB"
+  ip_protocol                  = "tcp"
+  from_port                    = var.backend_alb_port
+  to_port                      = var.backend_alb_port
+  referenced_security_group_id = aws_security_group.backend_alb.id
+}
+
+# ---- Internal ALB (backend) ----------------------------------------------------
+resource "aws_vpc_security_group_ingress_rule" "backend_alb_from_frontend" {
+  security_group_id            = aws_security_group.backend_alb.id
+  description                  = "API calls from frontend tasks"
+  ip_protocol                  = "tcp"
+  from_port                    = var.backend_alb_port
+  to_port                      = var.backend_alb_port
+  referenced_security_group_id = aws_security_group.frontend.id
+}
+
+resource "aws_vpc_security_group_egress_rule" "backend_alb_to_backend" {
+  security_group_id            = aws_security_group.backend_alb.id
+  description                  = "Forward to backend tasks"
   ip_protocol                  = "tcp"
   from_port                    = var.backend_port
   to_port                      = var.backend_port
@@ -119,13 +158,13 @@ resource "aws_vpc_security_group_egress_rule" "frontend_to_backend" {
 }
 
 # ---- Backend -----------------------------------------------------------------
-resource "aws_vpc_security_group_ingress_rule" "backend_from_frontend" {
+resource "aws_vpc_security_group_ingress_rule" "backend_from_backend_alb" {
   security_group_id            = aws_security_group.backend.id
-  description                  = "API calls from frontend"
+  description                  = "Traffic and health checks from the internal ALB"
   ip_protocol                  = "tcp"
   from_port                    = var.backend_port
   to_port                      = var.backend_port
-  referenced_security_group_id = aws_security_group.frontend.id
+  referenced_security_group_id = aws_security_group.backend_alb.id
 }
 
 resource "aws_vpc_security_group_egress_rule" "backend_to_rds" {

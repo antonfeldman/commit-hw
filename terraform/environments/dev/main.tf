@@ -11,10 +11,14 @@ locals {
   otel_image           = "${local.ecr_registry}/${local.otel_repository_name}:${var.otel_collector_version}"
   otel_repository_arn  = "arn:aws:ecr:${var.aws_region}:${local.account_id}:repository/${local.otel_repository_name}"
 
-  backend_url   = "http://backend.${module.ecs_cluster.namespace_name}:${var.backend_port}"
+  # Frontend -> backend goes through the internal ALB (blue/green target groups).
+  backend_url   = "http://${module.backend_alb.alb_dns_name}"
   otlp_endpoint = "http://otel.${module.ecs_cluster.namespace_name}:${var.otlp_grpc_port}"
 
   db_secret_arn = module.rds.master_user_secret_arn
+
+  # Blue/green services. Their image tag lives in SSM (the deploy trigger).
+  app_services = toset(["frontend", "backend"])
 
   # Container health checks use Python (the slim images have no curl).
   app_health_check = {
@@ -100,14 +104,42 @@ module "vpc_endpoints" {
 # =============================================================================
 # Edge, registry, data
 # =============================================================================
+module "tls_certificate" {
+  source = "../../modules/tls-certificate"
+
+  name        = local.name
+  domain_name = var.domain_name
+}
+
+# Public ALB: HTTPS :443 (self-signed cert from ACM) -> frontend; HTTP :80 -> 301.
 module "alb" {
   source = "../../modules/alb"
 
   name              = local.name
   vpc_id            = module.network.vpc_id
-  public_subnet_ids = module.network.public_subnet_ids
+  subnet_ids        = module.network.public_subnet_ids
   security_group_id = module.security_groups.alb_sg_id
-  frontend_port     = var.frontend_port
+  target_name       = "frontend"
+  target_port       = var.frontend_port
+
+  enable_https           = true
+  certificate_arn        = module.tls_certificate.acm_certificate_arn
+  redirect_http_to_https = true
+}
+
+# Internal ALB in the private subnets: frontend -> backend. Needed because
+# CodeDeploy blue/green shifts traffic between two target groups of a load balancer.
+module "backend_alb" {
+  source = "../../modules/alb"
+
+  name              = local.name
+  internal          = true
+  vpc_id            = module.network.vpc_id
+  subnet_ids        = module.network.private_subnet_ids
+  security_group_id = module.security_groups.backend_alb_sg_id
+  target_name       = "backend"
+  target_port       = var.backend_port
+  http_port         = 80
 }
 
 module "ecr" {
@@ -145,7 +177,7 @@ module "frontend" {
   aws_region           = var.aws_region
   cluster_arn          = module.ecs_cluster.cluster_arn
   cluster_name         = module.ecs_cluster.cluster_name
-  image                = "${module.ecr.repository_urls["frontend"]}:${var.image_tag}"
+  image                = "${module.ecr.repository_urls["frontend"]}:${local.image_tags["frontend"]}"
   ecr_repository_arns  = [module.ecr.repository_arns["frontend"]]
   container_port       = var.frontend_port
   desired_count        = var.app_desired_count
@@ -154,8 +186,9 @@ module "frontend" {
   health_check_command = local.app_health_check["frontend"]
   log_retention_days   = var.log_retention_days
 
-  attach_load_balancer = true
-  target_group_arn     = module.alb.frontend_target_group_arn
+  deployment_controller = "CODE_DEPLOY"
+  attach_load_balancer  = true
+  target_group_arn      = module.alb.blue_target_group_arn
 
   environment = {
     PORT                        = tostring(var.frontend_port)
@@ -176,7 +209,7 @@ module "backend" {
   aws_region           = var.aws_region
   cluster_arn          = module.ecs_cluster.cluster_arn
   cluster_name         = module.ecs_cluster.cluster_name
-  image                = "${module.ecr.repository_urls["backend"]}:${var.image_tag}"
+  image                = "${module.ecr.repository_urls["backend"]}:${local.image_tags["backend"]}"
   ecr_repository_arns  = [module.ecr.repository_arns["backend"]]
   container_port       = var.backend_port
   desired_count        = var.app_desired_count
@@ -185,9 +218,9 @@ module "backend" {
   health_check_command = local.app_health_check["backend"]
   log_retention_days   = var.log_retention_days
 
-  enable_service_discovery       = true
-  service_discovery_namespace_id = module.ecs_cluster.namespace_id
-  service_discovery_name         = "backend"
+  deployment_controller = "CODE_DEPLOY"
+  attach_load_balancer  = true
+  target_group_arn      = module.backend_alb.blue_target_group_arn
 
   environment = {
     PORT                        = tostring(var.backend_port)
@@ -205,6 +238,8 @@ module "backend" {
     DB_PASSWORD = "${local.db_secret_arn}:password::"
   }
   secret_arns = [local.db_secret_arn]
+
+  depends_on = [module.backend_alb]
 }
 
 # ---- OpenTelemetry collector (AWS Distro for OpenTelemetry) -------------------
@@ -270,6 +305,79 @@ module "otel_collector" {
 }
 
 # =============================================================================
+# Blue/green delivery: SSM image tag -> EventBridge -> Lambda -> CodeDeploy
+# =============================================================================
+
+# Source of truth for the deployed image tag of each app. CI overwrites it;
+# Terraform only seeds it, then reads the live value back so its own task
+# definition revisions always reference the image that is actually deployed.
+resource "aws_ssm_parameter" "image_tag" {
+  for_each = local.app_services
+
+  name            = "/${var.project_name}/${var.environment}/${each.key}/image-tag"
+  description     = "Deployed image tag of ${each.key}. Changing it triggers a CodeDeploy blue/green deployment."
+  type            = "String"
+  value           = var.image_tag
+  allowed_pattern = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+
+  lifecycle {
+    ignore_changes = [value] # owned by the pipeline after creation
+  }
+}
+
+locals {
+  image_tags = { for svc, p in aws_ssm_parameter.image_tag : svc => nonsensitive(p.value) }
+
+  app_modules = {
+    frontend = { svc = module.frontend, alb = module.alb, repo = "frontend" }
+    backend  = { svc = module.backend, alb = module.backend_alb, repo = "backend" }
+  }
+}
+
+module "codedeploy" {
+  source = "../../modules/codedeploy-ecs"
+
+  name                   = local.name
+  cluster_name           = module.ecs_cluster.cluster_name
+  deployment_config_name = var.deployment_config_name
+
+  services = {
+    for k, m in local.app_modules : k => {
+      service_name            = m.svc.service_name
+      production_listener_arn = m.alb.production_listener_arn
+      target_group_names      = m.alb.target_group_names
+      alb_arn_suffix          = m.alb.alb_arn_suffix
+      pass_role_arns          = [m.svc.task_role_arn, m.svc.execution_role_arn]
+    }
+  }
+}
+
+module "deploy_automation" {
+  source = "../../modules/deploy-automation"
+
+  name                  = local.name
+  codedeploy_app_name   = module.codedeploy.app_name
+  codedeploy_app_arn    = module.codedeploy.app_arn
+  deployment_config_arn = module.codedeploy.deployment_config_arn
+  log_retention_days    = var.log_retention_days
+
+  services = {
+    for k, m in local.app_modules : k => {
+      parameter_name         = aws_ssm_parameter.image_tag[k].name
+      repository_name        = "${var.project_name}/${m.repo}"
+      repository_arn         = module.ecr.repository_arns[m.repo]
+      repository_url         = module.ecr.repository_urls[m.repo]
+      task_definition_family = m.svc.task_definition_family
+      container_name         = m.svc.container_name
+      container_port         = k == "frontend" ? var.frontend_port : var.backend_port
+      deployment_group_name  = module.codedeploy.deployment_group_names[k]
+      deployment_group_arn   = module.codedeploy.deployment_group_arns[k]
+      pass_role_arns         = [m.svc.task_role_arn, m.svc.execution_role_arn]
+    }
+  }
+}
+
+# =============================================================================
 # Identity: GitHub Actions OIDC + read-only reviewer
 # =============================================================================
 module "github_oidc" {
@@ -281,6 +389,10 @@ module "github_oidc" {
   allowed_refs         = var.github_allowed_refs
   ecr_repository_arns  = values(module.ecr.repository_arns)
   create_oidc_provider = var.create_github_oidc_provider
+
+  enable_deploy_permissions = true
+  image_tag_parameter_arns  = [for p in aws_ssm_parameter.image_tag : p.arn]
+  deployment_group_arns     = values(module.codedeploy.deployment_group_arns)
 }
 
 module "readonly_reviewer" {
@@ -288,4 +400,32 @@ module "readonly_reviewer" {
 
   user_name   = var.reviewer_user_name
   require_mfa = var.reviewer_require_mfa
+}
+
+# =============================================================================
+# State moves for the Phase 2 refactor (adopt existing resources, no re-create)
+# =============================================================================
+moved {
+  from = module.alb.aws_lb_target_group.frontend
+  to   = module.alb.aws_lb_target_group.this["blue"]
+}
+
+moved {
+  from = module.alb.aws_lb_listener.http
+  to   = module.alb.aws_lb_listener.http_redirect[0]
+}
+
+moved {
+  from = module.otel_collector.aws_ecs_service.this
+  to   = module.otel_collector.aws_ecs_service.this[0]
+}
+
+moved {
+  from = module.frontend.aws_ecs_service.this
+  to   = module.frontend.aws_ecs_service.blue_green[0]
+}
+
+moved {
+  from = module.backend.aws_ecs_service.this
+  to   = module.backend.aws_ecs_service.blue_green[0]
 }

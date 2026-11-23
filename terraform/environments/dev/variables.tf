@@ -60,14 +60,27 @@ variable "data_subnet_cidrs" {
 }
 
 variable "alb_ingress_cidrs" {
-  description = "CIDRs allowed to reach the ALB on HTTP/80."
+  description = "CIDRs allowed to reach the public ALB on 443 (and 80, which redirects to HTTPS)."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
 
+# ---- TLS / delivery ----------------------------------------------------------
+variable "domain_name" {
+  description = "Domain of the self-signed certificate. Point it at the ALB IPs in /etc/hosts (scripts/update-hosts.sh)."
+  type        = string
+  default     = "anton.com"
+}
+
+variable "deployment_config_name" {
+  description = "CodeDeploy traffic-shifting configuration for the blue/green deployments."
+  type        = string
+  default     = "CodeDeployDefault.ECSCanary10Percent5Minutes"
+}
+
 # ---- Application -------------------------------------------------------------
 variable "image_tag" {
-  description = "Tag of the frontend/backend images in ECR (the git commit SHA pushed by CI or scripts/build-and-push.sh)."
+  description = "Initial image tag (git commit SHA) seeded into the SSM image-tag parameters. After that the pipeline owns the tags."
   type        = string
 
   validation {

@@ -5,7 +5,7 @@
 # pull-through cache with the ADOT collector image.
 #
 # Uses your local AWS CLI credentials (`aws configure`). In CI the same thing is
-# done by .github/workflows/build-push.yml using OIDC.
+# done by .github/workflows/deploy.yml using OIDC.
 #
 # Usage:  ./scripts/build-and-push.sh [tag]      (default tag: git short SHA)
 # -----------------------------------------------------------------------------
@@ -39,5 +39,6 @@ docker pull --platform linux/arm64 \
   "${REGISTRY}/ecr-public/aws-observability/aws-otel-collector:${OTEL_VERSION}" >/dev/null
 
 echo
-echo "Done. Deploy with:"
-echo "  cd terraform/environments/dev && terraform apply -var image_tag=${TAG}"
+echo "Done. Deploy (CodeDeploy blue/green via the SSM trigger) with:"
+echo "  aws ssm put-parameter --overwrite --type String --name /${PROJECT}/dev/frontend/image-tag --value ${TAG}"
+echo "  aws ssm put-parameter --overwrite --type String --name /${PROJECT}/dev/backend/image-tag  --value ${TAG}"

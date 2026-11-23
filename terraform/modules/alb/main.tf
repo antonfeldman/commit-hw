@@ -1,12 +1,34 @@
 # -----------------------------------------------------------------------------
-# Internet-facing ALB, HTTP only (per requirements), forwarding to the frontend.
+# Application Load Balancer with a blue/green target-group pair for CodeDeploy.
+# Used twice:
+#   * public  (internet-facing): HTTPS :443 -> frontend, HTTP :80 -> 301 to HTTPS
+#   * internal (private subnets): HTTP :80 -> backend (traffic never leaves the VPC)
+#
+# CodeDeploy owns the "production" listener's default action during blue/green
+# deployments (it swaps / weights blue and green), so Terraform ignores changes
+# to it after creation.
 # -----------------------------------------------------------------------------
 
+locals {
+  lb_name = var.internal ? "${var.name}-int-alb" : "${var.name}-alb"
+
+  # Blue keeps the original (pre blue/green) name so the existing target group is
+  # adopted in place instead of being replaced.
+  target_group_names = {
+    blue  = "${var.name}-${var.target_name}"
+    green = "${var.name}-${var.target_name}-green"
+  }
+
+  http_redirect = var.enable_https && var.redirect_http_to_https
+
+  production_listener_arn = var.enable_https ? aws_lb_listener.https[0].arn : aws_lb_listener.http_forward[0].arn
+}
+
 resource "aws_lb" "this" {
-  name                       = "${var.name}-alb"
+  name                       = local.lb_name
   load_balancer_type         = "application"
-  internal                   = false
-  subnets                    = var.public_subnet_ids
+  internal                   = var.internal
+  subnets                    = var.subnet_ids
   security_groups            = [var.security_group_id]
   drop_invalid_header_fields = true # mitigates HTTP desync / header smuggling
   enable_deletion_protection = var.enable_deletion_protection
@@ -21,32 +43,82 @@ resource "aws_lb" "this" {
   depends_on = [aws_s3_bucket_policy.access_logs]
 }
 
-resource "aws_lb_target_group" "frontend" {
-  name                 = "${var.name}-frontend"
+resource "aws_lb_target_group" "this" {
+  for_each = local.target_group_names
+
+  name                 = each.value
   vpc_id               = var.vpc_id
   target_type          = "ip" # required for Fargate (awsvpc)
-  port                 = var.frontend_port
+  port                 = var.target_port
   protocol             = "HTTP"
   deregistration_delay = 15
 
   health_check {
-    path                = "/health"
+    path                = var.health_check_path
     matcher             = "200"
     interval            = 15
     timeout             = 5
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
+
+  tags = { Name = each.value, Color = each.key }
 }
 
-resource "aws_lb_listener" "http" {
+# ---- HTTPS :443 (production listener when TLS is enabled) -------------------
+resource "aws_lb_listener" "https" {
+  count = var.enable_https ? 1 : 0
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = var.ssl_policy # TLS 1.3 + TLS 1.2 with forward-secret ciphers only
+  certificate_arn   = var.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.this["blue"].arn
+  }
+
+  lifecycle {
+    ignore_changes = [default_action] # managed by CodeDeploy
+  }
+}
+
+# ---- HTTP :80 -> 301 redirect to HTTPS --------------------------------------
+resource "aws_lb_listener" "http_redirect" {
+  count = local.http_redirect ? 1 : 0
+
   load_balancer_arn = aws_lb.this.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
+    type = "redirect"
+
+    redirect {
+      protocol    = "HTTPS"
+      port        = "443"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# ---- HTTP forward (production listener when TLS is disabled, e.g. internal) --
+resource "aws_lb_listener" "http_forward" {
+  count = var.enable_https ? 0 : 1
+
+  load_balancer_arn = aws_lb.this.arn
+  port              = var.http_port
+  protocol          = "HTTP"
+
+  default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.frontend.arn
+    target_group_arn = aws_lb_target_group.this["blue"].arn
+  }
+
+  lifecycle {
+    ignore_changes = [default_action] # managed by CodeDeploy
   }
 }
 
@@ -54,7 +126,7 @@ resource "aws_lb_listener" "http" {
 # Access-log bucket (private, encrypted with SSE-S3 - the only option ALB supports)
 # -----------------------------------------------------------------------------
 resource "aws_s3_bucket" "access_logs" {
-  bucket_prefix = "${var.name}-alb-logs-"
+  bucket_prefix = "${local.lb_name}-logs-"
   force_destroy = var.force_destroy_logs
 }
 

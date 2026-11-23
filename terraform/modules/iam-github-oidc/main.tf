@@ -52,7 +52,7 @@ data "aws_iam_policy_document" "assume" {
 
 resource "aws_iam_role" "github_actions" {
   name                 = "${var.name}-github-actions"
-  description          = "Assumed by GitHub Actions (${var.github_repository}) via OIDC to push images to ECR"
+  description          = "Assumed by GitHub Actions (${var.github_repository}) via OIDC to push images to ECR and trigger deployments"
   assume_role_policy   = data.aws_iam_policy_document.assume.json
   max_session_duration = 3600
 }
@@ -77,6 +77,28 @@ data "aws_iam_policy_document" "permissions" {
       "ecr:UploadLayerPart",
     ]
     resources = var.ecr_repository_arns
+  }
+
+  # Deploy = write the new image tag to SSM; EventBridge + Lambda + CodeDeploy do
+  # the rest. The pipeline cannot touch ECS, IAM or the load balancers directly.
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "PublishImageTagParameters"
+      actions   = ["ssm:GetParameter", "ssm:PutParameter"]
+      resources = var.image_tag_parameter_arns
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "WatchBlueGreenDeployments"
+      actions   = ["codedeploy:ListDeployments", "codedeploy:GetDeployment"]
+      resources = var.deployment_group_arns
+    }
   }
 }
 

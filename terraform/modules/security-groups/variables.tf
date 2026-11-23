@@ -14,7 +14,7 @@ variable "vpc_id" {
 }
 
 variable "alb_ingress_cidrs" {
-  description = "IPv4 CIDRs allowed to reach the ALB on port 80. Defaults to the whole internet (public service)."
+  description = "IPv4 CIDRs allowed to reach the public ALB on ports 80 and 443. Defaults to the whole internet (public service)."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
@@ -39,4 +39,10 @@ variable "otlp_grpc_port" {
   description = "OTLP/gRPC port exposed by the collector."
   type        = number
   default     = 4317
+}
+
+variable "backend_alb_port" {
+  description = "Listener port of the internal (backend) ALB."
+  type        = number
+  default     = 80
 }

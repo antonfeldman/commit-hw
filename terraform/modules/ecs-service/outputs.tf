@@ -1,6 +1,6 @@
 output "service_name" {
   description = "Name of the ECS service."
-  value       = aws_ecs_service.this.name
+  value       = one(concat(aws_ecs_service.this[*].name, aws_ecs_service.blue_green[*].name))
 }
 
 output "task_role_arn" {
@@ -21,4 +21,14 @@ output "log_group_name" {
 output "task_definition_arn" {
   description = "ARN of the current task definition revision."
   value       = aws_ecs_task_definition.this.arn
+}
+
+output "task_definition_family" {
+  description = "Task definition family (new revisions are registered by the deploy automation)."
+  value       = aws_ecs_task_definition.this.family
+}
+
+output "container_name" {
+  description = "Name of the application container."
+  value       = var.name
 }

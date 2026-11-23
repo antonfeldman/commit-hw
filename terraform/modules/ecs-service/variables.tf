@@ -167,3 +167,14 @@ variable "log_retention_days" {
   type        = number
   default     = 30
 }
+
+variable "deployment_controller" {
+  description = "ECS = rolling update managed by ECS; CODE_DEPLOY = blue/green managed by AWS CodeDeploy (requires a load balancer)."
+  type        = string
+  default     = "ECS"
+
+  validation {
+    condition     = contains(["ECS", "CODE_DEPLOY"], var.deployment_controller)
+    error_message = "deployment_controller must be ECS or CODE_DEPLOY."
+  }
+}

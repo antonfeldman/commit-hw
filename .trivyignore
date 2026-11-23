@@ -1,10 +1,11 @@
 # Accepted findings - each one is a requirement of the assignment or an AWS limitation.
 
-# ALB is internet-facing: the frontend must be exposed to the internet.
+# Public ALB is internet-facing: the frontend must be exposed to the internet.
 AVD-AWS-0053
 
-# HTTP listener: the assignment requires exposure "with ALB over HTTP only".
+# Plain-HTTP listener: only the INTERNAL backend ALB forwards HTTP, inside the VPC
+# (frontend SG -> ALB SG -> backend SG). The public ALB's :80 only redirects to HTTPS.
 AVD-AWS-0054
 
-# ALB access-log bucket uses SSE-S3: ALB log delivery supports only SSE-S3, not SSE-KMS.
+# ALB access-log buckets use SSE-S3: ALB log delivery supports only SSE-S3, not SSE-KMS.
 AVD-AWS-0132

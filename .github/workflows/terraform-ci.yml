@@ -2,8 +2,9 @@ name: terraform-ci
 
 # Static checks only - needs no AWS access.
 on:
+  # Runs on every PR (no path filter): its jobs are required status checks of the
+  # main-branch ruleset, and a required check that never runs would block merging.
   pull_request:
-    paths: ["terraform/**", ".github/workflows/terraform-ci.yml"]
   push:
     branches: [main]
     paths: ["terraform/**", ".github/workflows/terraform-ci.yml"]

@@ -3,7 +3,7 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
-tfplan
+tfplan*
 crash.log
 crash.*.log
 override.tf
@@ -35,3 +35,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Lambda packages built by the archive provider
+.build/
