@@ -10,7 +10,7 @@ import time
 
 import psycopg
 from flask import Flask, jsonify
-from opentelemetry import metrics
+from opentelemetry import metrics, trace
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
 from psycopg.conninfo import make_conninfo
@@ -27,6 +27,7 @@ log = logging.getLogger(SERVICE_NAME)
 configure_telemetry(SERVICE_NAME)
 PsycopgInstrumentor().instrument(enable_commenter=False)
 
+tracer = trace.get_tracer(SERVICE_NAME)
 meter = metrics.get_meter(SERVICE_NAME)
 db_queries = meter.create_counter("backend.db.queries", description="Counter queries executed")
 
@@ -48,24 +49,32 @@ def _conninfo() -> str:
 
 
 def init_schema(retries: int = 30, delay: float = 5.0) -> None:
-    """Create the counter table once. Retries while RDS / networking come up."""
-    for attempt in range(1, retries + 1):
-        try:
-            with psycopg.connect(_conninfo()) as conn:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS hello_counter ("
-                    " id INTEGER PRIMARY KEY,"
-                    " value BIGINT NOT NULL)"
-                )
-                conn.execute(
-                    "INSERT INTO hello_counter (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
-                )
-            log.info("schema ready")
-            return
-        except psycopg.OperationalError as exc:
-            log.warning("database not ready (attempt %d/%d): %s", attempt, retries, exc)
-            time.sleep(delay)
-    raise RuntimeError("database never became available")
+    """Create the counter table once. Retries while RDS / networking come up.
+
+    Wrapped in a parent span so the startup SQL is attributed to the backend
+    service in X-Ray instead of appearing as an orphan database node.
+    """
+    with tracer.start_as_current_span("backend.init_schema") as span:
+        for attempt in range(1, retries + 1):
+            span.set_attribute("db.init.attempts", attempt)
+            try:
+                with psycopg.connect(_conninfo()) as conn:
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS hello_counter ("
+                        " id INTEGER PRIMARY KEY,"
+                        " value BIGINT NOT NULL)"
+                    )
+                    conn.execute(
+                        "INSERT INTO hello_counter (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
+                    )
+                log.info("schema ready")
+                return
+            except psycopg.OperationalError as exc:
+                span.add_event("database not ready", {"attempt": attempt, "error": str(exc)})
+                log.warning("database not ready (attempt %d/%d): %s", attempt, retries, exc)
+                time.sleep(delay)
+        span.set_status(trace.StatusCode.ERROR, "database never became available")
+        raise RuntimeError("database never became available")
 
 
 @app.get("/api/value")
