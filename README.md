@@ -185,8 +185,9 @@ terraform -chdir=terraform/environments/dev output -raw github_actions_role_arn
 GitHub → repository **Settings → Secrets and variables → Actions → Variables** →
 add `AWS_ROLE_ARN` with that value. This is a *variable*, not a secret, because it isn't
 sensitive. After that, every push to `main` that changes `apps/**` builds and pushes the
-images using OIDC. Deploy a new tag with
-`terraform apply -var image_tag=<sha>`.
+images using OIDC. To deploy a new build, set `image_tag = "<sha>"` in
+`terraform/environments/dev/terraform.tfvars`, commit it, then run `terraform plan -out=tfplan` and
+`terraform apply tfplan`. That way git always records which image version is deployed.
 
 ### 8. Give the reviewer read-only access
 
