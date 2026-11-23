@@ -277,6 +277,7 @@ module "github_oidc" {
 
   name                 = local.name
   github_repository    = var.github_repository
+  oidc_subject_prefix  = var.github_oidc_subject_prefix
   allowed_refs         = var.github_allowed_refs
   ecr_repository_arns  = values(module.ecr.repository_arns)
   create_oidc_provider = var.create_github_oidc_provider

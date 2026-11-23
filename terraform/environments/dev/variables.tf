@@ -150,6 +150,12 @@ variable "github_repository" {
   type        = string
 }
 
+variable "github_oidc_subject_prefix" {
+  description = "OIDC 'sub' claim prefix of the repo (immutable format: repo:owner@<id>/name@<id>). null = classic repo:owner/name."
+  type        = string
+  default     = null
+}
+
 variable "github_allowed_refs" {
   description = "Git refs allowed to assume the CI role."
   type        = list(string)
