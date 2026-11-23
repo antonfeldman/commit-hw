@@ -20,6 +20,13 @@ resource "aws_iam_user_policy_attachment" "read_only" {
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
+# Lets the user change only their OWN password - required because the temporary
+# console password is created with "password reset required".
+resource "aws_iam_user_policy_attachment" "change_own_password" {
+  user       = aws_iam_user.reviewer.name
+  policy_arn = "arn:aws:iam::aws:policy/IAMUserChangePassword"
+}
+
 data "aws_iam_policy_document" "enforce_mfa" {
   statement {
     sid = "AllowSelfServiceMfaAndPassword"

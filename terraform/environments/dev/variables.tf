@@ -167,3 +167,9 @@ variable "reviewer_user_name" {
   type        = string
   default     = "commit-reviewer"
 }
+
+variable "reviewer_require_mfa" {
+  description = "Require the reviewer to sign in with MFA before any action is allowed. Off by default to keep the interview review frictionless (the user is read-only and has no access keys)."
+  type        = bool
+  default     = false
+}

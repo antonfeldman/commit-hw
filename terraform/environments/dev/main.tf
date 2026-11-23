@@ -285,5 +285,6 @@ module "github_oidc" {
 module "readonly_reviewer" {
   source = "../../modules/iam-readonly-reviewer"
 
-  user_name = var.reviewer_user_name
+  user_name   = var.reviewer_user_name
+  require_mfa = var.reviewer_require_mfa
 }
