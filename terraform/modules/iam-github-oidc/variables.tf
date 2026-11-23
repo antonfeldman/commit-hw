@@ -45,3 +45,21 @@ variable "create_oidc_provider" {
   type        = bool
   default     = true
 }
+
+variable "enable_deploy_permissions" {
+  description = "Allow the workflow to publish image tags to SSM and watch CodeDeploy deployments."
+  type        = bool
+  default     = false
+}
+
+variable "image_tag_parameter_arns" {
+  description = "SSM parameters (image tags) the workflow may read and overwrite."
+  type        = list(string)
+  default     = []
+}
+
+variable "deployment_group_arns" {
+  description = "CodeDeploy deployment groups whose deployments the workflow may list and read."
+  type        = list(string)
+  default     = []
+}

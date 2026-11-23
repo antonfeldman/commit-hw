@@ -1,13 +1,15 @@
 # -----------------------------------------------------------------------------
 # Generic Fargate service: task definition, per-service IAM roles, log group,
 # optional ALB registration and optional Cloud Map (DNS) registration.
-# Used three times: frontend, backend, otel-collector.
+# Used three times: frontend, backend (blue/green via CodeDeploy) and
+# otel-collector (rolling update with circuit breaker).
 # -----------------------------------------------------------------------------
 
 data "aws_caller_identity" "current" {}
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
+  blue_green = var.deployment_controller == "CODE_DEPLOY"
 
   container_definition = {
     name                   = var.name
@@ -161,6 +163,9 @@ resource "aws_ecs_task_definition" "this" {
   container_definitions = jsonencode([
     { for k, v in local.container_definition : k => v if v != null }
   ])
+
+  # Blue/green: keep old revisions registered so CodeDeploy can always roll back.
+  skip_destroy = local.blue_green
 }
 
 resource "aws_service_discovery_service" "this" {
@@ -179,7 +184,10 @@ resource "aws_service_discovery_service" "this" {
   }
 }
 
+# Rolling-update service (ECS deployment controller) - used by the OTel collector.
 resource "aws_ecs_service" "this" {
+  count = local.blue_green ? 0 : 1
+
   name                   = var.name
   cluster                = var.cluster_arn
   task_definition        = aws_ecs_task_definition.this.arn
@@ -219,6 +227,51 @@ resource "aws_ecs_service" "this" {
 
     content {
       registry_arn = service_registries.value.arn
+    }
+  }
+}
+
+# Blue/green service (CODE_DEPLOY deployment controller) - frontend and backend.
+# After creation CodeDeploy owns the task definition and the active target group
+# (it creates a "green" task set, shifts traffic, then removes "blue"), so
+# Terraform must not fight it over those two attributes.
+resource "aws_ecs_service" "blue_green" {
+  count = local.blue_green ? 1 : 0
+
+  name                   = var.name
+  cluster                = var.cluster_arn
+  task_definition        = aws_ecs_task_definition.this.arn
+  desired_count          = var.desired_count
+  launch_type            = "FARGATE"
+  platform_version       = "LATEST"
+  enable_execute_command = false
+  propagate_tags         = "SERVICE"
+
+  health_check_grace_period_seconds = 60
+
+  deployment_controller {
+    type = "CODE_DEPLOY"
+  }
+
+  network_configuration {
+    subnets          = var.subnet_ids
+    security_groups  = var.security_group_ids
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = var.target_group_arn
+    container_name   = var.name
+    container_port   = var.container_port
+  }
+
+  lifecycle {
+    # platform_version: task sets report the resolved version (1.4.0), not LATEST.
+    ignore_changes = [task_definition, load_balancer, platform_version]
+
+    precondition {
+      condition     = var.attach_load_balancer && !var.enable_service_discovery
+      error_message = "CODE_DEPLOY services need a load balancer and do not support Cloud Map service discovery."
     }
   }
 }

@@ -6,28 +6,55 @@ by the backend on every request. Each browser request produces **one end-to-end 
 (client → frontend → backend → PostgreSQL), and you can view it as a service map in
 **CloudWatch / AWS X-Ray**.
 
+**Phase 2** adds HTTPS with a self-signed certificate (`anton.com`, created by Terraform,
+private key in Secrets Manager, imported into ACM), **blue/green deployments with AWS
+CodeDeploy** for both services, and a GitHub Actions pipeline whose deploy step is a single
+SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
+
 ---
 
 ## Architecture
 
 ```
-                         Internet
-                            │  HTTP :80
+                    Internet  (https://anton.com → /etc/hosts → ALB IPs)
+                            │  HTTPS :443 (self-signed cert from ACM)   HTTP :80 → 301 to HTTPS
                 ┌───────────▼───────────┐
  Public subnets │   Application LB      │  10.0.0.0/24, 10.0.1.0/24   (route 0.0.0.0/0 → IGW)
  (us-east-1a/b) └───────────┬───────────┘
-                            │ :8080
+                            │ :8080  target groups frontend (blue) / frontend-green
                 ┌───────────▼───────────┐        ┌──────────────────────┐
  Private        │ frontend (Fargate ×2) │──OTLP─▶│ otel-collector (ADOT)│──▶ X-Ray (traces)
  subnets        └───────────┬───────────┘        │  ECS service ×1      │──▶ CloudWatch (EMF metrics)
- 10.0.10.0/24               │ backend.commit.local└──────────▲───────────┘
- 10.0.11.0/24   ┌───────────▼───────────┐                   │ OTLP
- (NO internet)  │ backend  (Fargate ×2) │───────────────────┘
+ 10.0.10.0/24               │ HTTP :80           └──────────▲───────────┘
+ 10.0.11.0/24   ┌───────────▼───────────┐                   │
+ (NO internet)  │ internal ALB          │                   │
+                └───────────┬───────────┘                   │
+                            │ :8080  target groups backend (blue) / backend-green
+                ┌───────────▼───────────┐                   │ OTLP
+                │ backend  (Fargate ×2) │───────────────────┘
                 └───────────┬───────────┘     VPC endpoints: ecr.api, ecr.dkr, logs,
                             │ :5432 (TLS)     xray, secretsmanager (interface) + S3 (gateway)
                 ┌───────────▼───────────┐
  Data subnets   │ RDS PostgreSQL 17     │  10.0.20.0/24, 10.0.21.0/24
  (isolated)     └───────────────────────┘  route table: local only + NACL (5432 from private only)
+```
+
+**Delivery (Phase 2)**
+
+```
+ git push (apps/**) ──▶ GitHub Actions (OIDC) ──▶ build arm64 image ──▶ ECR (immutable tag = git SHA)
+                                   │
+                                   └─ aws ssm put-parameter /commit-hw/dev/<app>/image-tag = <sha>
+                                                      │  "Parameter Store Change" event
+                                                      ▼
+                       EventBridge rule ──▶ Lambda commit-hw-dev-ecs-deployer
+                                              1. verify the image exists in ECR
+                                              2. register a task-definition revision with the new image
+                                              3. CodeDeploy CreateDeployment (inline AppSpec)
+                                                      ▼
+                       CodeDeploy blue/green: green task set in the idle target group
+                         → canary 10% of traffic for 5 min → 100% → blue kept 5 min → terminated
+                         → automatic rollback on failure or on the target-5XX alarm
 ```
 
 ### Requirement → implementation
@@ -41,7 +68,7 @@ by the backend on every request. Each browser request produces **one end-to-end 
 | Data subnets isolated, no 0.0.0.0 route | Their route table has **only the local route**, with no IGW or NAT. A NACL allows only 5432 in from the private subnets. |
 | Routes + limited security groups | Every SG rule is a separate resource that references another SG. **No SG allows egress to everywhere.** See [Security design](#security-design). |
 | ECS cluster, 2 Fargate services (front + back) | `modules/ecs-cluster`, `modules/ecs-service` (2 tasks each, one per AZ) |
-| Ingress to frontend via ALB, HTTP only | `modules/alb`: internet-facing ALB, listener on :80 → frontend target group |
+| Ingress to frontend via ALB, HTTP only (Phase 1) | `modules/alb`: internet-facing ALB. Phase 2 moved the app to HTTPS :443 and turned :80 into a 301 redirect. |
 | RDS PostgreSQL, backend queries it | `modules/rds`. The backend runs `UPDATE hello_counter … RETURNING value`. |
 | Frontend pulls the value every X seconds | The page auto-refreshes every `refresh_seconds` (default 5). Each refresh calls the backend, which queries the DB. |
 | OpenTelemetry in both services | `apps/*/telemetry.py`: OTel SDK with Flask, requests and psycopg instrumentation, and X-Ray-compatible trace IDs |
@@ -52,6 +79,19 @@ by the backend on every request. Each browser request produces **one end-to-end 
 | Read-only credentials for the reviewer | IAM user `commit-reviewer` with `ReadOnlyAccess`, console only, **no access keys**. MFA enforcement is available through `reviewer_require_mfa`. |
 | Infrastructure via Terraform | Everything under `terraform/` |
 | State bucket created manually, state in S3 | `bootstrap/create-state-bucket.sh` (AWS CLI), plus the S3 backend with native locking |
+
+### Phase 2 requirement → implementation
+
+| Requirement | Implementation |
+|---|---|
+| Self-signed TLS cert, created in Terraform | `modules/tls-certificate`: `tls_private_key` (RSA-2048) + `tls_self_signed_cert` for `anton.com`, 1 year, renewed by Terraform 30 days before expiry |
+| Private key in Secrets Manager | Secret `commit-hw-dev/tls/anton.com-…` (cert + key, JSON), encrypted with a **dedicated KMS key** with rotation |
+| Upload to ACM | `aws_acm_certificate` (imported) → ALB HTTPS listener, policy `ELBSecurityPolicy-TLS13-1-2-Res-2021-06` |
+| Domain in /etc/hosts with the ALB IPs | `sudo ./scripts/update-hosts.sh` resolves the ALB's current IPs and writes a managed block for `anton.com` |
+| GitHub Actions pipeline deploys the new frontend | `.github/workflows/deploy.yml`: build → push → publish tag to SSM → wait for the CodeDeploy result |
+| ECS update strategy blue/green | Frontend **and** backend use the `CODE_DEPLOY` controller with two target groups each (`modules/codedeploy-ecs`); the backend got an internal ALB for it |
+| SSM parameter change → CodeDeploy | `modules/deploy-automation`: EventBridge rule on `/commit-hw/dev/{frontend,backend}/image-tag` → Lambda → CodeDeploy |
+| Repo read-only for others | Only the owner has write access; `scripts/protect-github-repo.sh` adds a `main` ruleset (PR + CI required, no force-push/deletion, owner bypass), fork-PR workflow approval, read-only `GITHUB_TOKEN`; `.github/CODEOWNERS` |
 
 ---
 
@@ -65,23 +105,29 @@ by the backend on every request. Each browser request produces **one end-to-end 
 ├── bootstrap/
 │   └── create-state-bucket.sh   one-time manual creation of the state bucket
 ├── scripts/
-│   └── build-and-push.sh        build arm64 images, push to ECR (local creds)
+│   ├── build-and-push.sh        build arm64 images, push to ECR (local creds)
+│   ├── update-hosts.sh          point anton.com at the ALB IPs in /etc/hosts
+│   └── protect-github-repo.sh   GitHub ruleset + Actions hardening (idempotent)
 ├── terraform/
 │   ├── environments/dev/    root module: wires the modules together
 │   └── modules/
 │       ├── network/             VPC, subnets, IGW, route tables, data NACL, flow logs
 │       ├── security-groups/     all SGs + least-privilege rules
 │       ├── vpc-endpoints/       PrivateLink endpoints + S3 gateway endpoint
-│       ├── alb/                 public ALB (HTTP), target group, access-log bucket
+│       ├── alb/                 ALB (public or internal), blue/green TGs, HTTPS, access logs
+│       ├── tls-certificate/     self-signed cert → ACM + Secrets Manager (KMS)
+│       ├── codedeploy-ecs/      CodeDeploy app, deployment groups, rollback alarms, role
+│       ├── deploy-automation/   SSM-change → EventBridge → Lambda (src/handler.py)
 │       ├── ecr/                 app repositories + ECR Public pull-through cache
 │       ├── rds/                 PostgreSQL, parameter group (force SSL), managed secret
 │       ├── ecs-cluster/         cluster (Container Insights) + Cloud Map namespace
 │       ├── ecs-service/         reusable Fargate service (used 3×)
-│       ├── iam-github-oidc/     OIDC provider + CI role (ECR push only)
+│       ├── iam-github-oidc/     OIDC provider + CI role (ECR push, image-tag SSM write)
 │       └── iam-readonly-reviewer/  read-only IAM user (optional MFA enforcement)
 ├── .github/workflows/
 │   ├── terraform-ci.yml     fmt, validate, tflint, Trivy (no AWS access)
-│   └── build-push.yml       OIDC → build & push images
+│   └── deploy.yml           OIDC → build, push, publish tag to SSM, watch CodeDeploy
+├── .github/CODEOWNERS
 ├── .tflint.hcl
 └── .trivyignore             accepted findings, with justification
 ```
@@ -133,6 +179,10 @@ terraform plan -var image_tag=$TAG -out=tfplan   # review the plan
 terraform apply tfplan
 ```
 
+`image_tag` only **seeds** the SSM image-tag parameters on the first apply. After that the
+parameters (written by the pipeline) are the source of truth for the deployed version,
+and Terraform reads them back.
+
 The first apply takes about 10–15 minutes, mostly for RDS. The ECS services are created,
 but their tasks can't start until the images exist (next step).
 
@@ -154,15 +204,24 @@ done
 aws ecs wait services-stable --cluster commit-hw-dev --services otel-collector backend frontend
 ```
 
-### 5. Open the application
+### 5. Open the application (https://anton.com)
+
+The certificate is for `anton.com`, which is not in public DNS for this ALB, so map it
+locally to the ALB's current IP addresses:
 
 ```bash
-curl -s $(terraform -chdir=terraform/environments/dev output -raw frontend_url)
+./scripts/update-hosts.sh                 # shows the IPs it would write
+sudo ./scripts/update-hosts.sh anton.com "$(terraform -chdir=terraform/environments/dev output -raw alb_dns_name)"
+curl -k https://anton.com/                # -k: the certificate is self-signed
 # <h1>Hello Commit 7</h1>
+curl -sI http://anton.com/ | head -2      # 301 → https://anton.com:443/
 ```
 
-Open the `frontend_url` in a browser. The page refreshes every 5 seconds and the number
-increases each time.
+In a browser, open **https://anton.com** and accept the self-signed-certificate warning
+(or trust it: `terraform output -raw tls_certificate_pem > anton.pem`, then add it to the
+macOS Keychain as trusted). The page refreshes every 5 seconds and the number increases.
+ALB IPs can change; re-run the script if the site stops answering.
+`sudo ./scripts/update-hosts.sh --remove` cleans `/etc/hosts` up.
 
 ### 6. View the traces (CloudWatch → X-Ray)
 
@@ -184,10 +243,47 @@ terraform -chdir=terraform/environments/dev output -raw github_actions_role_arn
 
 GitHub → repository **Settings → Secrets and variables → Actions → Variables** →
 add `AWS_ROLE_ARN` with that value. This is a *variable*, not a secret, because it isn't
-sensitive. After that, every push to `main` that changes `apps/**` builds and pushes the
-images using OIDC. To deploy a new build, set `image_tag = "<sha>"` in
-`terraform/environments/dev/terraform.tfvars`, commit it, then run `terraform plan -out=tfplan` and
-`terraform apply tfplan`. That way git always records which image version is deployed.
+sensitive.
+
+After that, every push to `main` that changes `apps/frontend` or `apps/backend` runs
+`deploy.yml` for the changed app(s):
+
+1. build the arm64 image and push `commit-hw/<app>:<git-sha>` (skipped if the tag exists),
+2. `aws ssm put-parameter /commit-hw/dev/<app>/image-tag = <git-sha>`,
+3. wait for the CodeDeploy deployment that the Lambda starts, and fail if it fails.
+
+**Manual deploy / rollback:** *Actions → build-and-deploy → Run workflow*, choose the app
+and optionally an existing `image_tag`. Without GitHub, the same trigger is one command:
+
+```bash
+aws ssm put-parameter --overwrite --type String \
+  --name /commit-hw/dev/frontend/image-tag --value <tag>
+```
+
+Writing the **same** tag again is a "refresh": it redeploys the latest task definition
+(for example after Terraform changed an environment variable).
+
+### 7a. Watch a blue/green deployment
+
+- **CodeDeploy console** → Applications → `commit-hw-dev` → deployment: traffic shifts
+  10% → 100%, then the original task set is terminated after 5 minutes.
+- **ALB listener** :443 shows the weights of `commit-hw-dev-frontend` / `-frontend-green`.
+- **Lambda logs:** `/aws/lambda/commit-hw-dev-ecs-deployer`.
+- A target-5XX alarm (`commit-hw-dev-<app>-target-5xx`) or any failure rolls back
+  automatically: traffic returns to the original task set, which is still running.
+
+### 7b. Protect the GitHub repository
+
+```bash
+./scripts/protect-github-repo.sh
+```
+
+Only the owner has write access (no collaborators), so others can read, fork and open
+PRs but cannot push. The script adds a ruleset on `main` (no deletion, no force-push,
+changes via PR with passing `validate` and `security-scan` checks; the repository admin
+may bypass), requires approval before workflows run for any outside contributor's PR,
+and makes the default `GITHUB_TOKEN` read-only. `.github/CODEOWNERS` assigns every path
+to the owner.
 
 ### 8. Give the reviewer read-only access
 
@@ -225,9 +321,10 @@ action, set `reviewer_require_mfa = true` and apply.
 
 | SG | Inbound | Outbound |
 |---|---|---|
-| alb | 80 from `0.0.0.0/0` | 8080 → frontend |
-| frontend | 8080 from alb | 8080 → backend, 4317 → collector, 443 → endpoints / S3 |
-| backend | 8080 from frontend | 5432 → rds, 4317 → collector, 443 → endpoints / S3 |
+| alb | 443, 80 (redirect) from `0.0.0.0/0` | 8080 → frontend |
+| frontend | 8080 from alb | 80 → backend-alb, 4317 → collector, 443 → endpoints / S3 |
+| backend-alb (internal) | 80 from frontend | 8080 → backend |
+| backend | 8080 from backend-alb | 5432 → rds, 4317 → collector, 443 → endpoints / S3 |
 | otel-collector | 4317 from frontend, backend | 443 → endpoints / S3 |
 | rds | 5432 from backend | none |
 | vpc-endpoints | 443 from frontend, backend, collector | none |
@@ -238,10 +335,24 @@ action, set `reviewer_require_mfa = true` and apply.
 - **Task roles** are empty for the apps. The collector can only write to X-Ray and to its
   own metrics log group.
 - The trust policies use `aws:SourceAccount` to prevent confused-deputy attacks.
-- The GitHub OIDC role can only push to the two project repositories, only from `main` of
-  this repository.
+- The GitHub OIDC role can only push to the two project repositories, write the two
+  image-tag parameters and read CodeDeploy deployment status - only from `main` of this
+  repository. It cannot change ECS, IAM or the load balancers itself.
+- The **deployer Lambda** may read only the image-tag parameters, describe images in the
+  two repositories, register task definitions, pass only the two services' task/execution
+  roles to ECS, and start deployments only in the two deployment groups.
+- The **CodeDeploy role** is a scoped replacement for `AWSCodeDeployRoleForECS`: task
+  sets of the two services only, `ModifyListener`/`ModifyRule` on the two production
+  listeners only, `PassRole` only for the services' roles.
 - The reviewer has `ReadOnlyAccess` and can change only their own password. They have no
   access keys and can't read secret values. MFA can be enforced with `reviewer_require_mfa = true`.
+
+**TLS**
+- Clients connect over TLS 1.2/1.3 with forward-secret ciphers only; :80 only redirects.
+- The private key is stored in Secrets Manager encrypted with a customer-managed KMS key
+  (rotation on). The reviewer's `ReadOnlyAccess` cannot read secret values.
+- Frontend → backend stays plain HTTP **inside the VPC** (private subnets, SG-to-SG
+  rules only). End-to-end TLS would need a private CA (ACM PCA) - see trade-offs.
 
 **Data and secrets**
 - The RDS master password is generated by RDS and stored in **Secrets Manager**
@@ -257,15 +368,15 @@ action, set `reviewer_require_mfa = true` and apply.
 
 **Static analysis:** `terraform validate`, `tflint` and `trivy config` (HIGH/CRITICAL)
 run in CI. The three accepted findings are listed in `.trivyignore` with a reason for each
-(public ALB, HTTP-only listener, and SSE-S3 for ALB logs, all required by the assignment
-or by AWS).
+(public ALB, the internal ALB's in-VPC HTTP listener, and SSE-S3 for ALB logs).
 
 ---
 
 ## Cost and teardown
 
-Approximate cost while running: **about $5/day**. The main items are the 5 interface
-endpoints × 2 AZs (about $2.40/day), the ALB, 5 Fargate tasks and RDS `db.t4g.micro`.
+Approximate cost while running: **about $5.70/day**. The main items are the 5 interface
+endpoints × 2 AZs (about $2.40/day), the two ALBs, 5 Fargate tasks and RDS `db.t4g.micro`.
+CodeDeploy for ECS, EventBridge and the Lambda are free or cents; the KMS key is $1/month.
 
 ```bash
 cd terraform/environments/dev
@@ -281,8 +392,21 @@ from the S3 console using **Empty** and then **Delete**.
 
 ## Known trade-offs
 
-- **HTTP only**, as the assignment requires. In production you would add an ACM
-  certificate, an HTTPS listener, a redirect from :80 to :443, and AWS WAF.
+- **Self-signed certificate**, as Phase 2 requires: browsers warn until it is trusted
+  locally. In production: a real domain in Route 53 with an ACM-issued (auto-renewed)
+  certificate, plus AWS WAF.
+- **The private key is also in the Terraform state** (the `tls` provider generates it).
+  The state bucket is private, encrypted, versioned and TLS-only. Generating the key
+  outside Terraform would keep it out of state, but the assignment asks for Terraform.
+- **CodeDeploy shifts one production listener**, so HTTP :80 redirects to HTTPS instead
+  of serving the app too (a forwarding :80 would stay on the old target group).
+- **Internal ALB for the backend** (~$16/month): CodeDeploy blue/green needs a load
+  balancer, and Cloud Map service discovery is not supported with the CODE_DEPLOY
+  controller. The backend's `backend.commit.local` record was removed.
+- **Task definitions have two writers**: Terraform registers a revision when you change
+  its settings, the Lambda registers one per deployment (latest revision + new image).
+  The running revision changes only through CodeDeploy; publish the same tag again to
+  roll out a Terraform-only change.
 - **RDS secret rotation:** the RDS-managed secret rotates every 7 days. Because ECS injects
   secrets when a task starts, run `aws ecs update-service --force-new-deployment` for the
   backend after a rotation. In production, the backend would read the secret at runtime

@@ -1,6 +1,49 @@
 output "frontend_url" {
-  description = "Public URL of the frontend (HTTP)."
-  value       = "http://${module.alb.alb_dns_name}"
+  description = "Public URL of the frontend (HTTPS, self-signed certificate; needs the /etc/hosts entry)."
+  value       = "https://${var.domain_name}"
+}
+
+output "alb_dns_name" {
+  description = "DNS name of the public ALB (resolve it for /etc/hosts: scripts/update-hosts.sh)."
+  value       = module.alb.alb_dns_name
+}
+
+output "backend_internal_url" {
+  description = "Internal ALB in front of the backend (reachable only from frontend tasks)."
+  value       = local.backend_url
+}
+
+output "tls_certificate_arn" {
+  description = "Imported self-signed certificate in ACM."
+  value       = module.tls_certificate.acm_certificate_arn
+}
+
+output "tls_secret_arn" {
+  description = "Secrets Manager secret with the certificate and private key (KMS-encrypted)."
+  value       = module.tls_certificate.secret_arn
+}
+
+output "tls_certificate_pem" {
+  description = "Public certificate (PEM), e.g. to trust it locally."
+  value       = module.tls_certificate.certificate_pem
+}
+
+output "image_tag_parameters" {
+  description = "SSM parameters that trigger a blue/green deployment when changed."
+  value       = { for k, p in aws_ssm_parameter.image_tag : k => p.name }
+}
+
+output "codedeploy_application" {
+  description = "CodeDeploy application and deployment groups."
+  value = {
+    application = module.codedeploy.app_name
+    groups      = module.codedeploy.deployment_group_names
+  }
+}
+
+output "deployer_function_name" {
+  description = "Lambda that turns an SSM image-tag change into a CodeDeploy deployment."
+  value       = module.deploy_automation.function_name
 }
 
 output "ecr_repository_urls" {
