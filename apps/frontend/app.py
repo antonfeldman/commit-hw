@@ -47,6 +47,7 @@ PAGE = """<!doctype html>
 <body>
   <h1>{message}</h1>
   <p>Value pulled from the database via the backend. Refreshes every {refresh}s.</p>
+  <p><small>v2 &middot; served over HTTPS &middot; deployed by GitHub Actions &rarr; SSM &rarr; CodeDeploy blue/green</small></p>
 </body>
 </html>
 """
