@@ -6,6 +6,11 @@
 
 locals {
   github_oidc_url = "token.actions.githubusercontent.com"
+
+  # GitHub "immutable subject" format embeds the numeric owner/repo IDs
+  # (repo:owner@<owner_id>/name@<repo_id>), so a deleted-and-recreated repo with
+  # the same name cannot assume the role. Falls back to the classic format.
+  subject_prefix = coalesce(var.oidc_subject_prefix, "repo:${var.github_repository}")
   provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : (
     "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${local.github_oidc_url}"
   )
@@ -40,7 +45,7 @@ data "aws_iam_policy_document" "assume" {
     condition {
       test     = "StringLike"
       variable = "${local.github_oidc_url}:sub"
-      values   = [for ref in var.allowed_refs : "repo:${var.github_repository}:ref:${ref}"]
+      values   = [for ref in var.allowed_refs : "${local.subject_prefix}:ref:${ref}"]
     }
   }
 }
