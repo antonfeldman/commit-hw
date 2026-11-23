@@ -19,8 +19,9 @@ resource "aws_db_parameter_group" "this" {
   description = "Hardened parameters for ${var.name}"
 
   parameter {
-    name  = "rds.force_ssl"
-    value = "1"
+    name         = "rds.force_ssl"
+    value        = "1"
+    apply_method = "pending-reboot" # as stored by AWS; avoids a perpetual diff (applied at DB creation)
   }
 
   parameter {

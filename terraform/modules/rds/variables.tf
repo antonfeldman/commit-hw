@@ -26,9 +26,14 @@ variable "instance_class" {
 }
 
 variable "database_name" {
-  description = "Name of the initial database."
+  description = "Name of the initial database. Must not be a PostgreSQL reserved word (e.g. 'commit')."
   type        = string
-  default     = "commit"
+  default     = "hellodb"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9_]{0,62}$", var.database_name)) && !contains(["commit", "user", "select", "table", "postgres", "template0", "template1"], var.database_name)
+    error_message = "database_name must be lowercase alphanumeric/underscore, start with a letter, and not be a reserved word."
+  }
 }
 
 variable "master_username" {
