@@ -1,0 +1,37 @@
+# --- Terraform ---
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Backend config contains the account-specific bucket name; an example is committed instead.
+backend.hcl
+# NOTE: .terraform.lock.hcl IS committed on purpose (pins provider checksums).
+
+# --- Credentials: never commit ---
+.aws/
+*.pem
+*.key
+.env
+.env.*
+credentials
+credentials.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,2 @@
+# Copy to backend.hcl (git-ignored) or let bootstrap/create-state-bucket.sh generate it.
+bucket = "commit-hw-tfstate-<ACCOUNT_ID>"
