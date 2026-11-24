@@ -6,7 +6,7 @@
 #   - MFA (optional, require_mfa): until the user signs in with MFA, everything except
 #     setting up their own MFA device and changing their own password is denied
 #   - The console password is NOT managed here (it would be stored in state);
-#     it is set once with the AWS CLI - see README.
+#     it is set once with the AWS CLI (aws iam create-login-profile).
 # -----------------------------------------------------------------------------
 
 data "aws_caller_identity" "current" {}
