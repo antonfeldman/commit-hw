@@ -4,7 +4,7 @@ output "frontend_url" {
 }
 
 output "alb_dns_name" {
-  description = "DNS name of the public ALB (resolve it for /etc/hosts: scripts/update-hosts.sh)."
+  description = "DNS name of the public ALB (resolve it with dig for /etc/hosts)."
   value       = module.alb.alb_dns_name
 }
 

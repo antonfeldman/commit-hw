@@ -87,11 +87,11 @@ SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
 | Self-signed TLS cert, created in Terraform | `modules/tls-certificate`: `tls_private_key` (RSA-2048) + `tls_self_signed_cert` for `anton.com`, 1 year, renewed by Terraform 30 days before expiry |
 | Private key in Secrets Manager | Secret `commit-hw-dev/tls/anton.com-…` (cert + key, JSON), encrypted with a **dedicated KMS key** with rotation |
 | Upload to ACM | `aws_acm_certificate` (imported) → ALB HTTPS listener, policy `ELBSecurityPolicy-TLS13-1-2-Res-2021-06` |
-| Domain in /etc/hosts with the ALB IPs | `sudo ./scripts/update-hosts.sh` resolves the ALB's current IPs and writes a managed block for `anton.com` |
+| Domain in /etc/hosts with the ALB IPs | Manual entry: resolve the ALB's current IPs with `dig` and add them to `/etc/hosts` for `anton.com` (step 5) |
 | GitHub Actions pipeline deploys the new frontend | `.github/workflows/deploy.yml`: build → push → publish tag to SSM → wait for the CodeDeploy result |
 | ECS update strategy blue/green | Frontend **and** backend use the `CODE_DEPLOY` controller with two target groups each (`modules/codedeploy-ecs`); the backend got an internal ALB for it |
 | SSM parameter change → CodeDeploy | `modules/deploy-automation`: EventBridge rule on `/commit-hw/dev/{frontend,backend}/image-tag` → Lambda → CodeDeploy |
-| Repo read-only for others | Only the owner has write access; `scripts/protect-github-repo.sh` adds a `main` ruleset (PR + CI required, no force-push/deletion, owner bypass), fork-PR workflow approval, read-only `GITHUB_TOKEN`; `.github/CODEOWNERS` |
+| Repo read-only for others | Only the owner has write access; GitHub settings: `main` ruleset (PR + CI required, no force-push/deletion, owner bypass), fork-PR workflow approval, read-only `GITHUB_TOKEN`; `.github/CODEOWNERS` |
 
 ---
 
@@ -104,10 +104,6 @@ SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
 │   └── backend/             Flask app: counter in PostgreSQL
 ├── bootstrap/
 │   └── create-state-bucket.sh   one-time manual creation of the state bucket
-├── scripts/
-│   ├── build-and-push.sh        build arm64 images, push to ECR (local creds)
-│   ├── update-hosts.sh          point anton.com at the ALB IPs in /etc/hosts
-│   └── protect-github-repo.sh   GitHub ruleset + Actions hardening (idempotent)
 ├── terraform/
 │   ├── environments/dev/    root module: wires the modules together
 │   └── modules/
@@ -190,17 +186,25 @@ but their tasks can't start until the images exist (next step).
 
 ```bash
 cd ../../..
-./scripts/build-and-push.sh $TAG
+REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.us-east-1.amazonaws.com"
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$REGISTRY"
+
+for app in frontend backend; do
+  docker buildx build --platform linux/arm64 --provenance=false \
+    -t "$REGISTRY/commit-hw/$app:$TAG" --push "apps/$app"
+done
+
+# Warm the ECR pull-through cache with the collector image (the tasks have no internet access).
+docker pull --platform linux/arm64 "$REGISTRY/ecr-public/aws-observability/aws-otel-collector:v0.51.0"
 ```
 
-This pushes `commit-hw/frontend:$TAG` and `commit-hw/backend:$TAG`, and warms the ECR
-pull-through cache with the ADOT collector image. Then restart the services so they pick
-up the images:
+This is needed only for a first deployment; afterwards `deploy.yml` builds the images.
+ECS retries failed task starts, so the services come up once the images exist.
+`--force-new-deployment` works only for the collector (rolling update); the frontend and
+backend are controlled by CodeDeploy.
 
 ```bash
-for s in otel-collector backend frontend; do
-  aws ecs update-service --cluster commit-hw-dev --service $s --force-new-deployment >/dev/null
-done
+aws ecs update-service --cluster commit-hw-dev --service otel-collector --force-new-deployment >/dev/null
 aws ecs wait services-stable --cluster commit-hw-dev --services otel-collector backend frontend
 ```
 
@@ -210,8 +214,9 @@ The certificate is for `anton.com`, which is not in public DNS for this ALB, so 
 locally to the ALB's current IP addresses:
 
 ```bash
-./scripts/update-hosts.sh                 # shows the IPs it would write
-sudo ./scripts/update-hosts.sh anton.com "$(terraform -chdir=terraform/environments/dev output -raw alb_dns_name)"
+ALB=$(terraform -chdir=terraform/environments/dev output -raw alb_dns_name)
+dig +short A "$ALB"                       # the ALB's current IPs
+dig +short A "$ALB" | sed 's/$/ anton.com/' | sudo tee -a /etc/hosts
 curl -k https://anton.com/                # -k: the certificate is self-signed
 # <h1>Hello Commit 7</h1>
 curl -sI http://anton.com/ | head -2      # 301 → https://anton.com:443/
@@ -220,8 +225,8 @@ curl -sI http://anton.com/ | head -2      # 301 → https://anton.com:443/
 In a browser, open **https://anton.com** and accept the self-signed-certificate warning
 (or trust it: `terraform output -raw tls_certificate_pem > anton.pem`, then add it to the
 macOS Keychain as trusted). The page refreshes every 5 seconds and the number increases.
-ALB IPs can change; re-run the script if the site stops answering.
-`sudo ./scripts/update-hosts.sh --remove` cleans `/etc/hosts` up.
+ALB IPs can change: if the site stops answering, delete the `anton.com` lines from
+`/etc/hosts` and add the current IPs again. Delete them too when you are done.
 
 ### 6. View the traces (CloudWatch → X-Ray)
 
@@ -274,15 +279,11 @@ Writing the **same** tag again is a "refresh": it redeploys the latest task defi
 
 ### 7b. Protect the GitHub repository
 
-```bash
-./scripts/protect-github-repo.sh
-```
-
 Only the owner has write access (no collaborators), so others can read, fork and open
-PRs but cannot push. The script adds a ruleset on `main` (no deletion, no force-push,
+PRs but cannot push. In the GitHub settings there is a ruleset on `main` (no deletion, no force-push,
 changes via PR with passing `validate` and `security-scan` checks; the repository admin
-may bypass), requires approval before workflows run for any outside contributor's PR,
-and makes the default `GITHUB_TOKEN` read-only. `.github/CODEOWNERS` assigns every path
+may bypass), workflows from any outside contributor's PR need approval, and the default
+`GITHUB_TOKEN` is read-only. `.github/CODEOWNERS` assigns every path
 to the owner.
 
 ### 8. Give the reviewer read-only access

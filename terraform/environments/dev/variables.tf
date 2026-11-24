@@ -67,7 +67,7 @@ variable "alb_ingress_cidrs" {
 
 # ---- TLS / delivery ----------------------------------------------------------
 variable "domain_name" {
-  description = "Domain of the self-signed certificate. Point it at the ALB IPs in /etc/hosts (scripts/update-hosts.sh)."
+  description = "Domain of the self-signed certificate. Point it at the ALB IPs in /etc/hosts."
   type        = string
   default     = "anton.com"
 }
