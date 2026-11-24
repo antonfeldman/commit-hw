@@ -1,8 +1,9 @@
 # -----------------------------------------------------------------------------
 # Read-only IAM user for the reviewer.
-#   - AWS managed ReadOnlyAccess (view everything, change nothing)
+#   - AWS managed ReadOnlyAccess (view everything, change nothing), except the
+#     Terraform state objects: the state contains the TLS private key
 #   - Console access only: no access keys are created
-#   - MFA enforced: until the user signs in with MFA, everything except
+#   - MFA (optional, require_mfa): until the user signs in with MFA, everything except
 #     setting up their own MFA device and changing their own password is denied
 #   - The console password is NOT managed here (it would be stored in state);
 #     it is set once with the AWS CLI - see README.
@@ -25,6 +26,23 @@ resource "aws_iam_user_policy_attachment" "read_only" {
 resource "aws_iam_user_policy_attachment" "change_own_password" {
   user       = aws_iam_user.reviewer.name
   policy_arn = "arn:aws:iam::aws:policy/IAMUserChangePassword"
+}
+
+# ReadOnlyAccess includes s3:GetObject on every bucket. The Terraform state holds
+# secrets (the TLS private key), so reading its objects and old versions is denied.
+data "aws_iam_policy_document" "deny_state_read" {
+  statement {
+    sid       = "DenyTerraformStateRead"
+    effect    = "Deny"
+    actions   = ["s3:GetObject*"]
+    resources = ["${var.state_bucket_arn}/*"]
+  }
+}
+
+resource "aws_iam_user_policy" "deny_state_read" {
+  name   = "deny-terraform-state-read"
+  user   = aws_iam_user.reviewer.name
+  policy = data.aws_iam_policy_document.deny_state_read.json
 }
 
 data "aws_iam_policy_document" "enforce_mfa" {
