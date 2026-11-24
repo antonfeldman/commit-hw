@@ -192,7 +192,6 @@ module "frontend" {
   environment = {
     PORT                        = tostring(var.frontend_port)
     BACKEND_URL                 = local.backend_url
-    REFRESH_SECONDS             = tostring(var.refresh_seconds)
     OTEL_SERVICE_NAME           = "frontend"
     OTEL_EXPORTER_OTLP_ENDPOINT = local.otlp_endpoint
   }

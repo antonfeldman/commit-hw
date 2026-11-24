@@ -1,8 +1,8 @@
 # Commit HW – AWS ECS Fargate + RDS + OpenTelemetry/X-Ray (Terraform)
 
 A two-tier application on AWS, built entirely with Terraform. The frontend shows
-**"Hello Commit X"**. X is a counter that is read from (and incremented in) RDS PostgreSQL
-by the backend on every request. Each browser request produces **one end-to-end trace**
+**"Hello Commit X"**. X is a counter in RDS PostgreSQL: the backend reads it on page load and
+increments it when you click **Update counter**. Each load or click produces **one end-to-end trace**
 (client → frontend → backend → PostgreSQL), and you can view it as a service map in
 **CloudWatch / AWS X-Ray**.
 
@@ -69,8 +69,8 @@ SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
 | Routes + limited security groups | Every SG rule is a separate resource that references another SG. **No SG allows egress to everywhere.** See [Security design](#security-design). |
 | ECS cluster, 2 Fargate services (front + back) | `modules/ecs-cluster`, `modules/ecs-service` (2 tasks each, one per AZ) |
 | Ingress to frontend via ALB, HTTP only (Phase 1) | `modules/alb`: internet-facing ALB. Phase 2 moved the app to HTTPS :443 and turned :80 into a 301 redirect. |
-| RDS PostgreSQL, backend queries it | `modules/rds`. The backend runs `UPDATE hello_counter … RETURNING value`. |
-| Frontend pulls the value every X seconds | The page auto-refreshes every `refresh_seconds` (default 5). Each refresh calls the backend, which queries the DB. |
+| RDS PostgreSQL, backend queries it | `modules/rds`. The backend runs `SELECT` on page load and `UPDATE hello_counter … RETURNING value` on a click. |
+| Frontend pulls the value from the backend | On page load the frontend reads the value (`GET`). A click on **Update counter** increments it (`POST`). The page no longer refreshes every X seconds (changed on request). |
 | OpenTelemetry in both services | `apps/*/telemetry.py`: OTel SDK with Flask, requests and psycopg instrumentation, and X-Ray-compatible trace IDs |
 | One trace: web → frontend → backend → DB | W3C trace context is passed frontend → backend, and the DB call is a client span → one X-Ray trace |
 | Service map in AWS console (managed service) | ADOT collector → **AWS X-Ray** (`awsxray` exporter). No Jaeger, Tempo or Zipkin. |
@@ -218,13 +218,13 @@ ALB=$(terraform -chdir=terraform/environments/dev output -raw alb_dns_name)
 dig +short A "$ALB"                       # the ALB's current IPs
 dig +short A "$ALB" | sed 's/$/ anton.com/' | sudo tee -a /etc/hosts
 curl -k https://anton.com/                # -k: the certificate is self-signed
-# <h1>Hello Commit 7</h1>
+# the page HTML, with <h1>Hello Commit <span id="value">7</span></h1>
 curl -sI http://anton.com/ | head -2      # 301 → https://anton.com:443/
 ```
 
 In a browser, open **https://anton.com** and accept the self-signed-certificate warning
 (or trust it: `terraform output -raw tls_certificate_pem > anton.pem`, then add it to the
-macOS Keychain as trusted). The page refreshes every 5 seconds and the number increases.
+macOS Keychain as trusted). The number increases only when you click **Update counter**.
 ALB IPs can change: if the site stops answering, delete the `anton.com` lines from
 `/etc/hosts` and add the current IPs again. Delete them too when you are done.
 
@@ -235,8 +235,9 @@ terraform -chdir=terraform/environments/dev output -raw xray_trace_map_url
 ```
 
 - **Trace Map:** shows `Client → frontend → backend → commit (PostgreSQL)`.
-- **Traces:** open any trace to see the timeline with the latency of each segment:
-  `GET /` (frontend) → `GET` (HTTP call) → `GET /api/value` (backend) → `UPDATE` (SQL).
+- **Traces:** click **Update counter**, then open the X-Ray trace ID shown on the page (sign in
+  to the AWS console first; a trace can take a little while to appear). The timeline shows:
+  `POST /api/increment` (frontend) → `POST` (HTTP call) → `POST /api/value` (backend) → `UPDATE` (SQL).
 - **Metrics:** CloudWatch → Metrics → namespace **`CommitHW`** (OTel metrics via EMF).
 - **Logs:** `/ecs/commit-hw-dev/{frontend,backend,otel-collector}`.
 
