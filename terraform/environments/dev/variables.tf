@@ -23,7 +23,7 @@ variable "aws_region" {
 }
 
 variable "log_retention_days" {
-  description = "Retention for all CloudWatch log groups."
+  description = "Retention for the application and Lambda log groups (VPC flow logs use the network module default)."
   type        = number
   default     = 30
 }

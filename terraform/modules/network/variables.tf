@@ -62,5 +62,5 @@ variable "db_port" {
 variable "log_retention_days" {
   description = "Retention of the VPC flow log group."
   type        = number
-  default     = 30
+  default     = 3
 }

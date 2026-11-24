@@ -74,7 +74,6 @@ module "network" {
   private_subnet_cidrs = var.private_subnet_cidrs
   data_subnet_cidrs    = var.data_subnet_cidrs
   db_port              = var.db_port
-  log_retention_days   = var.log_retention_days
 }
 
 module "security_groups" {
@@ -400,32 +399,4 @@ module "readonly_reviewer" {
 
   user_name   = var.reviewer_user_name
   require_mfa = var.reviewer_require_mfa
-}
-
-# =============================================================================
-# State moves for the Phase 2 refactor (adopt existing resources, no re-create)
-# =============================================================================
-moved {
-  from = module.alb.aws_lb_target_group.frontend
-  to   = module.alb.aws_lb_target_group.this["blue"]
-}
-
-moved {
-  from = module.alb.aws_lb_listener.http
-  to   = module.alb.aws_lb_listener.http_redirect[0]
-}
-
-moved {
-  from = module.otel_collector.aws_ecs_service.this
-  to   = module.otel_collector.aws_ecs_service.this[0]
-}
-
-moved {
-  from = module.frontend.aws_ecs_service.this
-  to   = module.frontend.aws_ecs_service.blue_green[0]
-}
-
-moved {
-  from = module.backend.aws_ecs_service.this
-  to   = module.backend.aws_ecs_service.blue_green[0]
 }
