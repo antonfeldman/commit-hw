@@ -413,6 +413,7 @@ from the S3 console using **Empty** and then **Delete**.
   or use IAM database authentication.
 - **One collector task and single-AZ RDS**, to keep costs down. Set
   `otel_collector_desired_count = 2` and `multi_az = true` for high availability.
-- **No NAT gateway:** the app tasks can reach only the AWS services that have a VPC
-  endpoint. That is the intended design, but a new external dependency would need an
-  endpoint or a NAT gateway.
+- **No NAT gateway (cost optimization):** the private subnets have no outgoing internet
+  traffic, so a NAT gateway would be paid for (about $33/month per AZ, plus data
+  processing) without being used. The app tasks reach only the AWS services that have a
+  VPC endpoint. A new external dependency would need an endpoint or a NAT gateway.
