@@ -1,7 +1,10 @@
 """Backend service: reads/increments a counter in RDS PostgreSQL.
 
-GET /api/value -> {"value": <int>}   (one DB round-trip, traced as a SQL span)
-GET /health    -> {"status": "ok"}   (excluded from tracing)
+GET  /api/value -> {"value": <int>}   reads the counter
+POST /api/value -> {"value": <int>}   increments it and returns the new value
+GET  /health    -> {"status": "ok"}   (excluded from tracing)
+
+Each /api/value call is one DB statement, traced as a SQL span.
 """
 
 import logging
@@ -79,14 +82,21 @@ def init_schema(retries: int = 30, delay: float = 5.0) -> None:
         raise RuntimeError("database never became available")
 
 
-@app.get("/api/value")
-def get_value():
+def _query_value(sql: str):
     with psycopg.connect(_conninfo()) as conn:
-        row = conn.execute(
-            "UPDATE hello_counter SET value = value + 1 WHERE id = 1 RETURNING value"
-        ).fetchone()
+        row = conn.execute(sql).fetchone()
     db_queries.add(1)
     return jsonify(value=row[0])
+
+
+@app.get("/api/value")
+def get_value():
+    return _query_value("SELECT value FROM hello_counter WHERE id = 1")
+
+
+@app.post("/api/value")
+def increment_value():
+    return _query_value("UPDATE hello_counter SET value = value + 1 WHERE id = 1 RETURNING value")
 
 
 @app.get("/health")
