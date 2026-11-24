@@ -47,19 +47,37 @@ variable "create_oidc_provider" {
 }
 
 variable "enable_deploy_permissions" {
-  description = "Allow the workflow to publish image tags to SSM and watch CodeDeploy deployments."
+  description = "Allow the workflow to register task definition revisions and start CodeDeploy deployments."
   type        = bool
   default     = false
 }
 
-variable "image_tag_parameter_arns" {
-  description = "SSM parameters (image tags) the workflow may read and overwrite."
+variable "task_definition_families" {
+  description = "Task definition families the workflow may register revisions of."
   type        = list(string)
   default     = []
 }
 
+variable "pass_role_arns" {
+  description = "Task and execution roles the workflow may pass to ECS."
+  type        = list(string)
+  default     = []
+}
+
+variable "codedeploy_app_arn" {
+  description = "CodeDeploy application that owns the deployment groups."
+  type        = string
+  default     = null
+}
+
+variable "deployment_config_arn" {
+  description = "CodeDeploy deployment configuration used by the groups."
+  type        = string
+  default     = null
+}
+
 variable "deployment_group_arns" {
-  description = "CodeDeploy deployment groups whose deployments the workflow may list and read."
+  description = "CodeDeploy deployment groups the workflow may start and read deployments of."
   type        = list(string)
   default     = []
 }
