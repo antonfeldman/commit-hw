@@ -5,6 +5,6 @@ github_repository = "antonfeldman/commit-hw"
 # Source: gh api repos/antonfeldman/commit-hw/actions/oidc/customization/sub
 github_oidc_subject_prefix = "repo:antonfeldman@57878914/commit-hw@1468523665"
 
-# Commit SHA of the images currently deployed (pushed to ECR by scripts/build-and-push.sh or CI).
-# To deploy a new build: push the images, update this value, then plan + apply.
+# Initial image tag that seeds the SSM image-tag parameters on the first apply.
+# After that the pipeline owns the tags (deploy.yml -> SSM -> CodeDeploy).
 image_tag = "def37a3"
