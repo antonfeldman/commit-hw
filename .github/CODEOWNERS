@@ -1,2 +1,3 @@
-# Every change needs the owner's review (enforced together with the main-branch ruleset).
+# The owner is the code owner of every path. GitHub requests their review on pull requests,
+# but the main-branch ruleset does not require it (0 approvals): this is a solo project.
 * @antonfeldman
