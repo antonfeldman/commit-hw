@@ -23,7 +23,7 @@ variable "aws_region" {
 }
 
 variable "log_retention_days" {
-  description = "Retention for the application and Lambda log groups (VPC flow logs use the network module default)."
+  description = "Retention for the application log groups (VPC flow logs use the network module default)."
   type        = number
   default     = 30
 }
@@ -79,13 +79,16 @@ variable "deployment_config_name" {
 }
 
 # ---- Application -------------------------------------------------------------
-variable "image_tag" {
-  description = "Initial image tag (git commit SHA) seeded into the SSM image-tag parameters. After that the pipeline owns the tags."
-  type        = string
+variable "image_tags" {
+  description = "Image tag (git commit SHA) per app in the task definitions that Terraform registers. It is the version a new environment starts with; later versions are deployed by GitHub Actions through CodeDeploy."
+  type        = map(string)
 
   validation {
-    condition     = var.image_tag != "latest" && length(var.image_tag) > 0
-    error_message = "Use an immutable tag such as the git commit SHA, not 'latest'."
+    condition = (
+      toset(keys(var.image_tags)) == toset(["frontend", "backend"]) &&
+      alltrue([for t in values(var.image_tags) : t != "latest" && length(t) > 0])
+    )
+    error_message = "Set immutable tags (git commit SHAs, not 'latest') for exactly: frontend, backend."
   }
 }
 

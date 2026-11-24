@@ -1,13 +1,13 @@
 name: build-and-deploy
 
-# Pipeline: build the changed app image -> push to ECR -> publish the tag to SSM.
-# The SSM change triggers EventBridge -> Lambda -> CodeDeploy blue/green
-# (canary 10% for 5 minutes, then 100%, automatic rollback on 5XX alarm).
-# This workflow then watches the CodeDeploy deployment until it finishes.
+# Pipeline: build the changed app image -> push to ECR -> CodeDeploy blue/green
+# (canary 10% for 5 minutes, then 100%, rollback on failure or 5XX alarm).
+# The workflow then watches the CodeDeploy deployment until it finishes.
 #
 # Authenticates to AWS with GitHub OIDC - no access keys are stored in GitHub.
-# The role can only push to the project ECR repos, write the image-tag
-# parameters and read deployment status - it cannot change ECS/IAM/ALB itself.
+# The role can push to the project ECR repos, register revisions of the two app task
+# definitions and start CodeDeploy deployments. It cannot update the ECS services, IAM
+# or the load balancers itself.
 on:
   push:
     branches: [main]
@@ -84,7 +84,7 @@ jobs:
     env:
       APP: ${{ matrix.app }}
       REPOSITORY: commit-hw/${{ matrix.app }}
-      PARAMETER: /commit-hw/dev/${{ matrix.app }}/image-tag
+      FAMILY: commit-hw-dev-${{ matrix.app }}
       CODEDEPLOY_APP: commit-hw-dev
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -140,41 +140,63 @@ jobs:
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ steps.tag.outputs.tag }}
 
-      # ---- Deploy: publish the tag; AWS does the blue/green --------------------
-      - name: Publish image tag to SSM (triggers CodeDeploy)
-        id: publish
+      # ---- Deploy: new task definition revision -> CodeDeploy blue/green -------
+      - name: Register task definition revision
+        id: taskdef
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          previous=$(aws ssm get-parameter --name "$PARAMETER" --query Parameter.Value --output text)
-          echo "start=$(date -u +%s)" >> "$GITHUB_OUTPUT"
-          aws ssm put-parameter --name "$PARAMETER" --value "$TAG" --type String --overwrite >/dev/null
-          echo "Published $PARAMETER: $previous -> $TAG"
+          # Start from the latest revision, so Terraform-managed settings are kept
+          # and only the image tag changes.
+          aws ecs describe-task-definition --task-definition "$FAMILY" --include TAGS > current.json
+          jq --arg app "$APP" --arg tag "$TAG" '
+            .tags as $tags
+            | .taskDefinition
+            | if any(.containerDefinitions[]; .name == $app) then . else error("container \($app) not found") end
+            | .containerDefinitions |= map(if .name == $app then .image |= sub(":[^:/]+$"; ":" + $tag) else . end)
+            | {family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions, volumes,
+               placementConstraints, requiresCompatibilities, cpu, memory, runtimePlatform,
+               ephemeralStorage, pidMode, ipcMode, proxyConfiguration}
+            | with_entries(select(.value != null)) + (if ($tags | length) > 0 then {tags: $tags} else {} end)
+          ' current.json > new.json
+          arn=$(aws ecs register-task-definition --cli-input-json file://new.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          port=$(jq -r --arg app "$APP" '.containerDefinitions[] | select(.name == $app) | .portMappings[0].containerPort' new.json)
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+          echo "port=$port" >> "$GITHUB_OUTPUT"
+          echo "Registered $arn"
+
+      - name: Start the CodeDeploy blue/green deployment
+        id: codedeploy
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          TASK_DEFINITION: ${{ steps.taskdef.outputs.arn }}
+          PORT: ${{ steps.taskdef.outputs.port }}
+        run: |
+          jq -n --arg td "$TASK_DEFINITION" --arg app "$APP" --argjson port "$PORT" \
+                --arg cd "$CODEDEPLOY_APP" --arg desc "$APP -> $TAG (GitHub run $GITHUB_RUN_ID)" '
+            { version: "0.0",
+              Resources: [{ TargetService: { Type: "AWS::ECS::Service", Properties: {
+                TaskDefinition: $td,
+                LoadBalancerInfo: { ContainerName: $app, ContainerPort: $port } } } }] } as $appspec
+            | { applicationName: $cd, deploymentGroupName: $app, description: $desc,
+                revision: { revisionType: "AppSpecContent", appSpecContent: { content: ($appspec | tojson) } } }
+          ' > deployment.json
+          id=$(aws deploy create-deployment --cli-input-json file://deployment.json --query deploymentId --output text)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "CodeDeploy deployment: $id" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Wait for the CodeDeploy blue/green deployment
         env:
-          START: ${{ steps.publish.outputs.start }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          deployment: ${{ steps.codedeploy.outputs.id }}
         run: |
-          deployment=""
-          for _ in $(seq 1 24); do   # up to 2 minutes for the Lambda to start it
-            deployment=$(aws deploy list-deployments \
-              --application-name "$CODEDEPLOY_APP" --deployment-group-name "$APP" \
-              --create-time-range start="$START" --query 'deployments[0]' --output text)
-            [ -n "$deployment" ] && [ "$deployment" != "None" ] && break
-            sleep 5
-          done
-          if [ -z "$deployment" ] || [ "$deployment" = "None" ]; then
-            echo "::error::no CodeDeploy deployment started - check the deployer Lambda logs"; exit 1
-          fi
-          echo "CodeDeploy deployment: $deployment"
-          echo "deployment=$deployment" >> "$GITHUB_STEP_SUMMARY"
-
           for _ in $(seq 1 120); do  # up to 30 minutes
             status=$(aws deploy get-deployment --deployment-id "$deployment" \
               --query 'deploymentInfo.status' --output text)
             echo "$(date -u +%H:%M:%S) $status"
             case "$status" in
-              Succeeded) echo "Deployed $APP:${{ steps.tag.outputs.tag }} (blue/green succeeded)" >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+              Succeeded) echo "Deployed $APP:$TAG (blue/green succeeded)" >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
               Failed|Stopped)
                 aws deploy get-deployment --deployment-id "$deployment" --query 'deploymentInfo.errorInformation'
                 echo "::error::deployment $deployment $status (CodeDeploy rolled back automatically)"; exit 1 ;;

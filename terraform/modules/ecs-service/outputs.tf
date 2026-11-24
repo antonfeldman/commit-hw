@@ -24,7 +24,7 @@ output "task_definition_arn" {
 }
 
 output "task_definition_family" {
-  description = "Task definition family (new revisions are registered by the deploy automation)."
+  description = "Task definition family (new revisions are registered by the deploy pipeline)."
   value       = aws_ecs_task_definition.this.family
 }
 

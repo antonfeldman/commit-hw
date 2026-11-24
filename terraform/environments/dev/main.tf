@@ -17,9 +17,6 @@ locals {
 
   db_secret_arn = module.rds.master_user_secret_arn
 
-  # Blue/green services. Their image tag lives in SSM (the deploy trigger).
-  app_services = toset(["frontend", "backend"])
-
   # Container health checks use Python (the slim images have no curl).
   app_health_check = {
     for svc, port in { frontend = var.frontend_port, backend = var.backend_port } : svc => [
@@ -176,7 +173,7 @@ module "frontend" {
   aws_region           = var.aws_region
   cluster_arn          = module.ecs_cluster.cluster_arn
   cluster_name         = module.ecs_cluster.cluster_name
-  image                = "${module.ecr.repository_urls["frontend"]}:${local.image_tags["frontend"]}"
+  image                = "${module.ecr.repository_urls["frontend"]}:${var.image_tags["frontend"]}"
   ecr_repository_arns  = [module.ecr.repository_arns["frontend"]]
   container_port       = var.frontend_port
   desired_count        = var.app_desired_count
@@ -207,7 +204,7 @@ module "backend" {
   aws_region           = var.aws_region
   cluster_arn          = module.ecs_cluster.cluster_arn
   cluster_name         = module.ecs_cluster.cluster_name
-  image                = "${module.ecr.repository_urls["backend"]}:${local.image_tags["backend"]}"
+  image                = "${module.ecr.repository_urls["backend"]}:${var.image_tags["backend"]}"
   ecr_repository_arns  = [module.ecr.repository_arns["backend"]]
   container_port       = var.backend_port
   desired_count        = var.app_desired_count
@@ -303,32 +300,12 @@ module "otel_collector" {
 }
 
 # =============================================================================
-# Blue/green delivery: SSM image tag -> EventBridge -> Lambda -> CodeDeploy
+# Blue/green delivery: GitHub Actions -> ECR -> CodeDeploy
 # =============================================================================
-
-# Source of truth for the deployed image tag of each app. CI overwrites it;
-# Terraform only seeds it, then reads the live value back so its own task
-# definition revisions always reference the image that is actually deployed.
-resource "aws_ssm_parameter" "image_tag" {
-  for_each = local.app_services
-
-  name            = "/${var.project_name}/${var.environment}/${each.key}/image-tag"
-  description     = "Deployed image tag of ${each.key}. Changing it triggers a CodeDeploy blue/green deployment."
-  type            = "String"
-  value           = var.image_tag
-  allowed_pattern = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-
-  lifecycle {
-    ignore_changes = [value] # owned by the pipeline after creation
-  }
-}
-
 locals {
-  image_tags = { for svc, p in aws_ssm_parameter.image_tag : svc => nonsensitive(p.value) }
-
   app_modules = {
-    frontend = { svc = module.frontend, alb = module.alb, repo = "frontend" }
-    backend  = { svc = module.backend, alb = module.backend_alb, repo = "backend" }
+    frontend = { svc = module.frontend, alb = module.alb }
+    backend  = { svc = module.backend, alb = module.backend_alb }
   }
 }
 
@@ -350,31 +327,6 @@ module "codedeploy" {
   }
 }
 
-module "deploy_automation" {
-  source = "../../modules/deploy-automation"
-
-  name                  = local.name
-  codedeploy_app_name   = module.codedeploy.app_name
-  codedeploy_app_arn    = module.codedeploy.app_arn
-  deployment_config_arn = module.codedeploy.deployment_config_arn
-  log_retention_days    = var.log_retention_days
-
-  services = {
-    for k, m in local.app_modules : k => {
-      parameter_name         = aws_ssm_parameter.image_tag[k].name
-      repository_name        = "${var.project_name}/${m.repo}"
-      repository_arn         = module.ecr.repository_arns[m.repo]
-      repository_url         = module.ecr.repository_urls[m.repo]
-      task_definition_family = m.svc.task_definition_family
-      container_name         = m.svc.container_name
-      container_port         = k == "frontend" ? var.frontend_port : var.backend_port
-      deployment_group_name  = module.codedeploy.deployment_group_names[k]
-      deployment_group_arn   = module.codedeploy.deployment_group_arns[k]
-      pass_role_arns         = [m.svc.task_role_arn, m.svc.execution_role_arn]
-    }
-  }
-}
-
 # =============================================================================
 # Identity: GitHub Actions OIDC + read-only reviewer
 # =============================================================================
@@ -389,8 +341,11 @@ module "github_oidc" {
   create_oidc_provider = var.create_github_oidc_provider
 
   enable_deploy_permissions = true
-  image_tag_parameter_arns  = [for p in aws_ssm_parameter.image_tag : p.arn]
+  codedeploy_app_arn        = module.codedeploy.app_arn
   deployment_group_arns     = values(module.codedeploy.deployment_group_arns)
+  deployment_config_arn     = module.codedeploy.deployment_config_arn
+  task_definition_families  = [for m in local.app_modules : m.svc.task_definition_family]
+  pass_role_arns            = flatten([for m in local.app_modules : [m.svc.task_role_arn, m.svc.execution_role_arn]])
 }
 
 module "readonly_reviewer" {

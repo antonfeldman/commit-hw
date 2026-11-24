@@ -14,9 +14,15 @@ locals {
   provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : (
     "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/${local.github_oidc_url}"
   )
+
+  task_definition_arns = [
+    for family in var.task_definition_families :
+    "arn:aws:ecs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:task-definition/${family}:*"
+  ]
 }
 
 data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
 
 # Only one GitHub OIDC provider can exist per account; set create_oidc_provider = false to reuse it.
 resource "aws_iam_openid_connect_provider" "github" {
@@ -79,15 +85,16 @@ data "aws_iam_policy_document" "permissions" {
     resources = var.ecr_repository_arns
   }
 
-  # Deploy = write the new image tag to SSM; EventBridge + Lambda + CodeDeploy do
-  # the rest. The pipeline cannot touch ECS, IAM or the load balancers directly.
+  # Deploy = register a task definition revision with the new image, then start a
+  # CodeDeploy blue/green deployment. The pipeline cannot update the ECS services
+  # or the load balancers itself: CodeDeploy does that with its own role.
   dynamic "statement" {
     for_each = var.enable_deploy_permissions ? [1] : []
 
     content {
-      sid       = "PublishImageTagParameters"
-      actions   = ["ssm:GetParameter", "ssm:PutParameter"]
-      resources = var.image_tag_parameter_arns
+      sid       = "ReadTaskDefinitions"
+      actions   = ["ecs:DescribeTaskDefinition"]
+      resources = ["*"] # does not support resource-level permissions
     }
   }
 
@@ -95,9 +102,71 @@ data "aws_iam_policy_document" "permissions" {
     for_each = var.enable_deploy_permissions ? [1] : []
 
     content {
-      sid       = "WatchBlueGreenDeployments"
-      actions   = ["codedeploy:ListDeployments", "codedeploy:GetDeployment"]
+      sid       = "RegisterOwnTaskDefinitions"
+      actions   = ["ecs:RegisterTaskDefinition"]
+      resources = local.task_definition_arns
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "TagNewTaskDefinitionsOnly"
+      actions   = ["ecs:TagResource"]
+      resources = local.task_definition_arns
+
+      condition {
+        test     = "StringEquals"
+        variable = "ecs:CreateAction"
+        values   = ["RegisterTaskDefinition"]
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "PassTaskRolesToEcsOnly"
+      actions   = ["iam:PassRole"]
+      resources = var.pass_role_arns
+
+      condition {
+        test     = "StringEquals"
+        variable = "iam:PassedToService"
+        values   = ["ecs-tasks.amazonaws.com"]
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "StartAndWatchDeployments"
+      actions   = ["codedeploy:CreateDeployment", "codedeploy:GetDeployment"]
       resources = var.deployment_group_arns
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "ReadDeploymentConfig"
+      actions   = ["codedeploy:GetDeploymentConfig"]
+      resources = [var.deployment_config_arn]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_deploy_permissions ? [1] : []
+
+    content {
+      sid       = "RegisterRevisions"
+      actions   = ["codedeploy:RegisterApplicationRevision", "codedeploy:GetApplicationRevision"]
+      resources = [var.codedeploy_app_arn]
     }
   }
 }

@@ -5,6 +5,9 @@ github_repository = "antonfeldman/commit-hw"
 # Source: gh api repos/antonfeldman/commit-hw/actions/oidc/customization/sub
 github_oidc_subject_prefix = "repo:antonfeldman@57878914/commit-hw@1468523665"
 
-# Initial image tag that seeds the SSM image-tag parameters on the first apply.
-# After that the pipeline owns the tags (deploy.yml -> SSM -> CodeDeploy).
-image_tag = "def37a3"
+# Image tags in the task definitions that Terraform registers. Newer versions are
+# deployed by GitHub Actions (deploy.yml -> CodeDeploy), not by changing these.
+image_tags = {
+  frontend = "9b13d16"
+  backend  = "5ee4fbd"
+}

@@ -28,22 +28,12 @@ output "tls_certificate_pem" {
   value       = module.tls_certificate.certificate_pem
 }
 
-output "image_tag_parameters" {
-  description = "SSM parameters that trigger a blue/green deployment when changed."
-  value       = { for k, p in aws_ssm_parameter.image_tag : k => p.name }
-}
-
 output "codedeploy_application" {
   description = "CodeDeploy application and deployment groups."
   value = {
     application = module.codedeploy.app_name
     groups      = module.codedeploy.deployment_group_names
   }
-}
-
-output "deployer_function_name" {
-  description = "Lambda that turns an SSM image-tag change into a CodeDeploy deployment."
-  value       = module.deploy_automation.function_name
 }
 
 output "ecr_repository_urls" {

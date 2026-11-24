@@ -8,8 +8,7 @@ increments it when you click **Update counter**. Each load or click produces **o
 
 **Phase 2** adds HTTPS with a self-signed certificate (`anton.com`, created by Terraform,
 private key in Secrets Manager, imported into ACM), **blue/green deployments with AWS
-CodeDeploy** for both services, and a GitHub Actions pipeline whose deploy step is a single
-SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
+CodeDeploy** for both services, and a GitHub Actions pipeline: **build → ECR → CodeDeploy**.
 
 ---
 
@@ -42,15 +41,10 @@ SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
 **Delivery (Phase 2)**
 
 ```
- git push (apps/**) ──▶ GitHub Actions (OIDC) ──▶ build arm64 image ──▶ ECR (immutable tag = git SHA)
-                                   │
-                                   └─ aws ssm put-parameter /commit-hw/dev/<app>/image-tag = <sha>
-                                                      │  "Parameter Store Change" event
-                                                      ▼
-                       EventBridge rule ──▶ Lambda commit-hw-dev-ecs-deployer
-                                              1. verify the image exists in ECR
-                                              2. register a task-definition revision with the new image
-                                              3. CodeDeploy CreateDeployment (inline AppSpec)
+ git push (apps/**) ──▶ GitHub Actions (OIDC)
+                          1. build arm64 image ──▶ ECR (immutable tag = git SHA)
+                          2. register a task-definition revision with the new image
+                          3. CodeDeploy CreateDeployment (inline AppSpec), wait for the result
                                                       ▼
                        CodeDeploy blue/green: green task set in the idle target group
                          → canary 10% of traffic for 5 min → 100% → blue kept 5 min → terminated
@@ -88,9 +82,9 @@ SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
 | Private key in Secrets Manager | Secret `commit-hw-dev/tls/anton.com-…` (cert + key, JSON), encrypted with a **dedicated KMS key** with rotation |
 | Upload to ACM | `aws_acm_certificate` (imported) → ALB HTTPS listener, policy `ELBSecurityPolicy-TLS13-1-2-Res-2021-06` |
 | Domain in /etc/hosts with the ALB IPs | Manual entry: resolve the ALB's current IPs with `dig` and add them to `/etc/hosts` for `anton.com` (step 5) |
-| GitHub Actions pipeline deploys the new frontend | `.github/workflows/deploy.yml`: build → push → publish tag to SSM → wait for the CodeDeploy result |
+| GitHub Actions pipeline deploys the new frontend | `.github/workflows/deploy.yml`: build → push → register task definition → start CodeDeploy → wait for the result |
 | ECS update strategy blue/green | Frontend **and** backend use the `CODE_DEPLOY` controller with two target groups each (`modules/codedeploy-ecs`); the backend got an internal ALB for it |
-| SSM parameter change → CodeDeploy | `modules/deploy-automation`: EventBridge rule on `/commit-hw/dev/{frontend,backend}/image-tag` → Lambda → CodeDeploy |
+| Deploy automation with CodeDeploy | `deploy.yml` starts the CodeDeploy deployment directly. |
 | Repo read-only for others | Only the owner has write access; GitHub settings: `main` ruleset (PR + CI required, no force-push/deletion, owner bypass), fork-PR workflow approval, read-only `GITHUB_TOKEN`; `.github/CODEOWNERS` |
 
 ---
@@ -113,16 +107,15 @@ SSM parameter change: **SSM → EventBridge → Lambda → CodeDeploy**.
 │       ├── alb/                 ALB (public or internal), blue/green TGs, HTTPS, access logs
 │       ├── tls-certificate/     self-signed cert → ACM + Secrets Manager (KMS)
 │       ├── codedeploy-ecs/      CodeDeploy app, deployment groups, rollback alarms, role
-│       ├── deploy-automation/   SSM-change → EventBridge → Lambda (src/handler.py)
 │       ├── ecr/                 app repositories + ECR Public pull-through cache
 │       ├── rds/                 PostgreSQL, parameter group (force SSL), managed secret
 │       ├── ecs-cluster/         cluster (Container Insights) + Cloud Map namespace
 │       ├── ecs-service/         reusable Fargate service (used 3×)
-│       ├── iam-github-oidc/     OIDC provider + CI role (ECR push, image-tag SSM write)
+│       ├── iam-github-oidc/     OIDC provider + CI role (ECR push, start CodeDeploy)
 │       └── iam-readonly-reviewer/  read-only IAM user (optional MFA enforcement)
 ├── .github/workflows/
 │   ├── terraform-ci.yml     fmt, validate, tflint, Trivy (no AWS access)
-│   └── deploy.yml           OIDC → build, push, publish tag to SSM, watch CodeDeploy
+│   └── deploy.yml           OIDC → build, push, start and watch CodeDeploy
 ├── .github/CODEOWNERS
 ├── .tflint.hcl
 └── .trivyignore             accepted findings, with justification
@@ -171,13 +164,13 @@ cd terraform/environments/dev
 export TAG=$(git rev-parse --short HEAD)
 
 terraform init -backend-config=backend.hcl
-terraform plan -var image_tag=$TAG -out=tfplan   # review the plan
+# New environment: first set image_tags in terraform.tfvars to $TAG for both apps
+terraform plan -out=tfplan   # review the plan
 terraform apply tfplan
 ```
 
-`image_tag` only **seeds** the SSM image-tag parameters on the first apply. After that the
-parameters (written by the pipeline) are the source of truth for the deployed version,
-and Terraform reads them back.
+`image_tags` is only the version that Terraform puts in the task definitions it registers.
+Later versions are deployed by the pipeline, and the running services ignore this value.
 
 The first apply takes about 10–15 minutes, mostly for RDS. The ECS services are created,
 but their tasks can't start until the images exist (next step).
@@ -255,26 +248,18 @@ After that, every push to `main` that changes `apps/frontend` or `apps/backend` 
 `deploy.yml` for the changed app(s):
 
 1. build the arm64 image and push `commit-hw/<app>:<git-sha>` (skipped if the tag exists),
-2. `aws ssm put-parameter /commit-hw/dev/<app>/image-tag = <git-sha>`,
-3. wait for the CodeDeploy deployment that the Lambda starts, and fail if it fails.
+2. register a task definition revision: the latest one with only the image changed,
+3. start the CodeDeploy blue/green deployment, wait for it, and fail if it fails.
 
 **Manual deploy / rollback:** *Actions → build-and-deploy → Run workflow*, choose the app
-and optionally an existing `image_tag`. Without GitHub, the same trigger is one command:
-
-```bash
-aws ssm put-parameter --overwrite --type String \
-  --name /commit-hw/dev/frontend/image-tag --value <tag>
-```
-
-Writing the **same** tag again is a "refresh": it redeploys the latest task definition
-(for example after Terraform changed an environment variable).
+and optionally an existing `image_tag`. Deploying the tag that is already live is a
+"refresh": it rolls out settings that Terraform changed, such as an environment variable.
 
 ### 7a. Watch a blue/green deployment
 
 - **CodeDeploy console** → Applications → `commit-hw-dev` → deployment: traffic shifts
   10% → 100%, then the original task set is terminated after 5 minutes.
 - **ALB listener** :443 shows the weights of `commit-hw-dev-frontend` / `-frontend-green`.
-- **Lambda logs:** `/aws/lambda/commit-hw-dev-ecs-deployer`.
 - A target-5XX alarm (`commit-hw-dev-<app>-target-5xx`) or any failure rolls back
   automatically: traffic returns to the original task set, which is still running.
 
@@ -337,12 +322,10 @@ action, set `reviewer_require_mfa = true` and apply.
 - **Task roles** are empty for the apps. The collector can only write to X-Ray and to its
   own metrics log group.
 - The trust policies use `aws:SourceAccount` to prevent confused-deputy attacks.
-- The GitHub OIDC role can only push to the two project repositories, write the two
-  image-tag parameters and read CodeDeploy deployment status - only from `main` of this
-  repository. It cannot change ECS, IAM or the load balancers itself.
-- The **deployer Lambda** may read only the image-tag parameters, describe images in the
-  two repositories, register task definitions, pass only the two services' task/execution
-  roles to ECS, and start deployments only in the two deployment groups.
+- The GitHub OIDC role, only from `main` of this repository, can push to the two project
+  repositories, register revisions of the two app task definitions, pass only those services'
+  roles to ECS, and start and read deployments of the two deployment groups. It cannot update
+  the ECS services, IAM or the load balancers itself.
 - The **CodeDeploy role** is a scoped replacement for `AWSCodeDeployRoleForECS`: task
   sets of the two services only, `ModifyListener`/`ModifyRule` on the two production
   listeners only, `PassRole` only for the services' roles.
@@ -378,11 +361,11 @@ run in CI. The three accepted findings are listed in `.trivyignore` with a reaso
 
 Approximate cost while running: **about $5.70/day**. The main items are the 5 interface
 endpoints × 2 AZs (about $2.40/day), the two ALBs, 5 Fargate tasks and RDS `db.t4g.micro`.
-CodeDeploy for ECS, EventBridge and the Lambda are free or cents; the KMS key is $1/month.
+CodeDeploy for ECS is free; the KMS key is $1/month.
 
 ```bash
 cd terraform/environments/dev
-terraform plan -destroy -var image_tag=$TAG -out=destroy.tfplan   # review what will be deleted
+terraform plan -destroy -out=destroy.tfplan   # review what will be deleted
 terraform apply destroy.tfplan
 ```
 
@@ -406,7 +389,7 @@ from the S3 console using **Empty** and then **Delete**.
   balancer, and Cloud Map service discovery is not supported with the CODE_DEPLOY
   controller. The backend's `backend.commit.local` record was removed.
 - **Task definitions have two writers**: Terraform registers a revision when you change
-  its settings, the Lambda registers one per deployment (latest revision + new image).
+  its settings, the pipeline registers one per deployment (latest revision + new image).
   The running revision changes only through CodeDeploy; publish the same tag again to
   roll out a Terraform-only change.
 - **RDS secret rotation:** the RDS-managed secret rotates every 7 days. Because ECS injects
