@@ -107,12 +107,6 @@ variable "app_desired_count" {
   default     = 2
 }
 
-variable "refresh_seconds" {
-  description = "How often (seconds) the frontend page re-pulls the value from the backend."
-  type        = number
-  default     = 5
-}
-
 variable "service_discovery_namespace" {
   description = "Private DNS namespace for service discovery."
   type        = string
