@@ -351,6 +351,7 @@ module "github_oidc" {
 module "readonly_reviewer" {
   source = "../../modules/iam-readonly-reviewer"
 
-  user_name   = var.reviewer_user_name
-  require_mfa = var.reviewer_require_mfa
+  user_name        = var.reviewer_user_name
+  require_mfa      = var.reviewer_require_mfa
+  state_bucket_arn = "arn:aws:s3:::${var.project_name}-tfstate-${local.account_id}"
 }

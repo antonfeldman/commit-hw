@@ -286,8 +286,8 @@ terraform -chdir=terraform/environments/dev output -raw reviewer_console_url
 Send the reviewer the URL, the user name `commit-reviewer` and the temporary password
 through a private channel. On first sign-in they must set a new password (the
 `IAMUserChangePassword` policy allows them to change only their own). After that they
-have `ReadOnlyAccess` to the whole account. They can't change anything, and they can't
-read secret values.
+have `ReadOnlyAccess` to the account, except the Terraform state objects. They can't change
+anything, and they can't read secret values.
 
 MFA is **off by default** so the interview review is quick. To require MFA before any
 action, set `reviewer_require_mfa = true` and apply.
@@ -330,7 +330,8 @@ action, set `reviewer_require_mfa = true` and apply.
   sets of the two services only, `ModifyListener`/`ModifyRule` on the two production
   listeners only, `PassRole` only for the services' roles.
 - The reviewer has `ReadOnlyAccess` and can change only their own password. They have no
-  access keys and can't read secret values. MFA can be enforced with `reviewer_require_mfa = true`.
+  access keys, can't read secret values, and are denied the Terraform state objects (the state
+  contains the TLS private key). MFA can be enforced with `reviewer_require_mfa = true`.
 
 **TLS**
 - Clients connect over TLS 1.2/1.3 with forward-secret ciphers only; :80 only redirects.

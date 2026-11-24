@@ -8,3 +8,8 @@ variable "require_mfa" {
   type        = bool
   default     = true
 }
+
+variable "state_bucket_arn" {
+  description = "ARN of the Terraform state bucket. The reviewer cannot read its objects, because the state contains secrets."
+  type        = string
+}
