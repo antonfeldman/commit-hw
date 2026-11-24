@@ -34,6 +34,7 @@ PAGE = """<!doctype html>
     button:disabled { opacity: .6; cursor: progress; }
     #status { min-height: 1.5em; }
     #status.error { color: var(--error); }
+    .footer { margin-top: 20px; font-size: .8125rem; }
     .trace { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); font-size: .875rem; color: var(--muted); }
     .trace a { display: inline-block; margin-top: 4px; color: var(--accent); overflow-wrap: anywhere;
                font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -49,6 +50,7 @@ PAGE = """<!doctype html>
       <span id="trace-label">X-Ray trace of this page load</span><br>
       <a id="trace" href="{{ trace_base }}{{ trace_id }}" target="_blank" rel="noopener noreferrer">{{ trace_id }}</a>
     </div>
+    <p class="footer">Built and deployed by GitHub Actions and CodeDeploy</p>
     <noscript><p>JavaScript is needed to update the counter.</p></noscript>
   </main>
   <script nonce="{{ nonce }}">
